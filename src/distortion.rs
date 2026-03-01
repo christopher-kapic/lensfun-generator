@@ -225,14 +225,24 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
 
     match at_w_a.lu().solve(&at_w_b) {
         Some(solution) => {
-            let a = solution[0];
-            let b = solution[1];
-            let c = solution[2];
-            let d = 1.0 - a - b - c;
+            let a_raw = solution[0];
+            let b_raw = solution[1];
+            let c_raw = solution[2];
 
             let residual = &a_mat * &solution - &b_vec;
             let rmse = (residual.dot(&residual) / n as f64).sqrt();
             eprintln!("    Fit RMSE: {:.6} (normalized radius units)", rmse);
+
+            // Our linear system fits the mapping: corrected → distorted.
+            // But we measured the displacement from the camera's correction
+            // perspective. The lensfun model uses the SAME convention
+            // (corrected → distorted), but our feature correspondences give
+            // us the camera's correction direction, so we negate to get the
+            // coefficients that UNDO the raw distortion.
+            let a = -a_raw;
+            let b = -b_raw;
+            let c = -c_raw;
+            let d = 1.0 - a - b - c;
             eprintln!("    d (linear term) = {:.6} (should be close to 1.0)", d);
 
             (a, b, c)
