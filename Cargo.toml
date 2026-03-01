@@ -1,0 +1,19 @@
+[package]
+name = "lensfun-generate"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lensfun-generate"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rawler = "0.7"
+image = "0.25"
+kamadak-exif = "0.5"
+nalgebra = "0.33"
+quick-xml = "0.37"
+indicatif = "0.17"
+dialoguer = "0.11"
