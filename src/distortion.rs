@@ -1,7 +1,7 @@
-use image::{DynamicImage, ImageBuffer, Rgb};
+use image::{DynamicImage, GrayImage, ImageBuffer, Rgb};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::similarity::ssim;
+use crate::similarity::distortion_similarity;
 
 /// Apply the ptlens distortion model to an RGB image.
 ///
@@ -73,18 +73,94 @@ pub fn apply_distortion(
     output
 }
 
-/// Automatically optimize distortion parameters by comparing corrected raw
-/// against the camera's embedded JPEG preview using SSIM.
+/// Find the largest centered rectangle in a distortion-corrected image that
+/// contains no black (out-of-bounds) pixels. Returns (x, y, width, height).
 ///
-/// Uses coordinate descent with ternary search: optimize a, b, c one at a time,
-/// repeating passes until convergence.
+/// We scan inward from each edge along the center axes to find where black
+/// pixels end, giving us the valid crop region.
+fn find_valid_crop(img: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> (u32, u32, u32, u32) {
+    let (w, h) = img.dimensions();
+    let cx = w / 2;
+    let cy = h / 2;
+
+    let is_black = |x: u32, y: u32| -> bool {
+        let p = img.get_pixel(x, y);
+        p[0] == 0 && p[1] == 0 && p[2] == 0
+    };
+
+    // Scan from left edge along center row
+    let mut left = 0u32;
+    for x in 0..cx {
+        if is_black(x, cy) {
+            left = x + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Scan from right edge
+    let mut right = w;
+    for x in (cx..w).rev() {
+        if is_black(x, cy) {
+            right = x;
+        } else {
+            break;
+        }
+    }
+
+    // Scan from top edge along center column
+    let mut top = 0u32;
+    for y in 0..cy {
+        if is_black(cx, y) {
+            top = y + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Scan from bottom edge
+    let mut bottom = h;
+    for y in (cy..h).rev() {
+        if is_black(cx, y) {
+            bottom = y;
+        } else {
+            break;
+        }
+    }
+
+    // Add a small margin to avoid edge artifacts
+    let margin = 4u32;
+    left = (left + margin).min(cx);
+    top = (top + margin).min(cy);
+    right = right.saturating_sub(margin).max(cx + 1);
+    bottom = bottom.saturating_sub(margin).max(cy + 1);
+
+    let crop_w = right - left;
+    let crop_h = bottom - top;
+
+    (left, top, crop_w, crop_h)
+}
+
+/// Crop a grayscale image to the given rectangle.
+fn crop_gray(img: &GrayImage, x: u32, y: u32, w: u32, h: u32) -> GrayImage {
+    DynamicImage::ImageLuma8(img.clone())
+        .crop_imm(x, y, w, h)
+        .into_luma8()
+}
+
+/// Automatically optimize distortion parameters by comparing corrected raw
+/// against the camera's embedded JPEG preview using edge-weighted SSIM.
+///
+/// Uses coordinate descent with ternary search, alternating parameter order
+/// across passes to avoid getting stuck in local optima.
+///
 /// Returns (a, b, c) distortion coefficients. The caller attaches the focal length.
 pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -> (f64, f64, f64) {
     let raw_rgb = raw_img.to_rgb8();
     let target_gray = DynamicImage::ImageRgb8(preview_img.to_rgb8()).into_luma8();
 
-    let max_passes = 5;
-    let ternary_iters = 20;
+    let max_passes = 10;
+    let ternary_iters = 25;
 
     let pb = ProgressBar::new(max_passes as u64);
     pb.set_style(
@@ -98,54 +174,66 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
     let mut b = 0.0_f64;
     let mut c = 0.0_f64;
 
+    // Evaluate distortion parameters by:
+    // 1. Applying the correction
+    // 2. Cropping to the valid (non-black) region
+    // 3. Cropping the target to the same region
+    // 4. Comparing with edge-weighted SSIM
     let evaluate = |a: f64, b: f64, c: f64| -> f64 {
         let corrected = apply_distortion(&raw_rgb, a, b, c);
+        let (cx, cy, cw, ch) = find_valid_crop(&corrected);
+        if cw < 32 || ch < 32 {
+            return 0.0; // Correction too extreme, almost no valid pixels
+        }
         let corrected_gray = DynamicImage::ImageRgb8(corrected).into_luma8();
-        ssim(&corrected_gray, &target_gray)
+        let cropped_corrected = crop_gray(&corrected_gray, cx, cy, cw, ch);
+        let cropped_target = crop_gray(&target_gray, cx, cy, cw, ch);
+        distortion_similarity(&cropped_corrected, &cropped_target)
     };
 
-    // First pass: coarse grid search to find a good starting region
+    // Coarse grid search to find a good starting point
     let grid_points = [-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3];
-    let mut best_ssim = f64::NEG_INFINITY;
+    let mut best_score = f64::NEG_INFINITY;
     for &ga in &grid_points {
         let s = evaluate(ga, 0.0, 0.0);
-        if s > best_ssim {
-            best_ssim = s;
+        if s > best_score {
+            best_score = s;
             a = ga;
         }
     }
     for &gb in &grid_points {
         let s = evaluate(a, gb, 0.0);
-        if s > best_ssim {
-            best_ssim = s;
+        if s > best_score {
+            best_score = s;
             b = gb;
         }
     }
     for &gc in &grid_points {
         let s = evaluate(a, b, gc);
-        if s > best_ssim {
-            best_ssim = s;
+        if s > best_score {
+            best_score = s;
             c = gc;
         }
     }
 
-    for _pass in 0..max_passes {
+    for pass in 0..max_passes {
         let prev_a = a;
         let prev_b = b;
         let prev_c = c;
 
-        // Optimize a
-        a = ternary_search(|val| evaluate(val, b, c), -0.3, 0.3, ternary_iters);
-
-        // Optimize b
-        b = ternary_search(|val| evaluate(a, val, c), -0.3, 0.3, ternary_iters);
-
-        // Optimize c
-        c = ternary_search(|val| evaluate(a, b, val), -0.5, 0.5, ternary_iters);
+        // Alternate parameter order: forward on even passes, reverse on odd
+        if pass % 2 == 0 {
+            a = ternary_search(|val| evaluate(val, b, c), -0.3, 0.3, ternary_iters);
+            b = ternary_search(|val| evaluate(a, val, c), -0.3, 0.3, ternary_iters);
+            c = ternary_search(|val| evaluate(a, b, val), -0.5, 0.5, ternary_iters);
+        } else {
+            c = ternary_search(|val| evaluate(a, b, val), -0.5, 0.5, ternary_iters);
+            b = ternary_search(|val| evaluate(a, val, c), -0.3, 0.3, ternary_iters);
+            a = ternary_search(|val| evaluate(val, b, c), -0.3, 0.3, ternary_iters);
+        }
 
         pb.inc(1);
 
-        // Check convergence
         let delta = (a - prev_a).abs() + (b - prev_b).abs() + (c - prev_c).abs();
         if delta < 1e-6 {
             break;
@@ -154,11 +242,13 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
 
     pb.finish_with_message("Distortion calibration complete");
 
+    let final_score = evaluate(a, b, c);
+    eprintln!("    Final similarity score: {:.6}", final_score);
+
     (a, b, c)
 }
 
 /// Ternary search for the maximum of a unimodal function on [lo, hi].
-/// The function should return SSIM (higher = better).
 fn ternary_search<F>(f: F, mut lo: f64, mut hi: f64, iterations: usize) -> f64
 where
     F: Fn(f64) -> f64,
