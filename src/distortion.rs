@@ -1,7 +1,5 @@
 use image::{DynamicImage, GrayImage, ImageBuffer, Rgb};
-use indicatif::{ProgressBar, ProgressStyle};
-
-use crate::similarity::distortion_similarity;
+use nalgebra::{DMatrix, DVector};
 
 /// Apply the ptlens distortion model to an RGB image.
 ///
@@ -9,6 +7,7 @@ use crate::similarity::distortion_similarity;
 ///
 /// where r is the normalized distance from the image center (0..1, with 1 = half-diagonal).
 /// Uses bilinear interpolation for smooth remapping.
+#[allow(dead_code)]
 pub fn apply_distortion(
     rgb: &ImageBuffer<Rgb<u8>, Vec<u8>>,
     a: f64,
@@ -73,196 +72,385 @@ pub fn apply_distortion(
     output
 }
 
-/// Find the largest centered rectangle in a distortion-corrected image that
-/// contains no black (out-of-bounds) pixels. Returns (x, y, width, height).
+/// Automatically determine distortion parameters by detecting feature points
+/// in both the raw decode and camera preview, matching them, and solving
+/// for the ptlens model coefficients via least-squares.
 ///
-/// We scan inward from each edge along the center axes to find where black
-/// pixels end, giving us the valid crop region.
-fn find_valid_crop(img: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> (u32, u32, u32, u32) {
-    let (w, h) = img.dimensions();
-    let cx = w / 2;
-    let cy = h / 2;
-
-    let is_black = |x: u32, y: u32| -> bool {
-        let p = img.get_pixel(x, y);
-        p[0] == 0 && p[1] == 0 && p[2] == 0
-    };
-
-    // Scan from left edge along center row
-    let mut left = 0u32;
-    for x in 0..cx {
-        if is_black(x, cy) {
-            left = x + 1;
-        } else {
-            break;
-        }
-    }
-
-    // Scan from right edge
-    let mut right = w;
-    for x in (cx..w).rev() {
-        if is_black(x, cy) {
-            right = x;
-        } else {
-            break;
-        }
-    }
-
-    // Scan from top edge along center column
-    let mut top = 0u32;
-    for y in 0..cy {
-        if is_black(cx, y) {
-            top = y + 1;
-        } else {
-            break;
-        }
-    }
-
-    // Scan from bottom edge
-    let mut bottom = h;
-    for y in (cy..h).rev() {
-        if is_black(cx, y) {
-            bottom = y;
-        } else {
-            break;
-        }
-    }
-
-    // Add a small margin to avoid edge artifacts
-    let margin = 4u32;
-    left = (left + margin).min(cx);
-    top = (top + margin).min(cy);
-    right = right.saturating_sub(margin).max(cx + 1);
-    bottom = bottom.saturating_sub(margin).max(cy + 1);
-
-    let crop_w = right - left;
-    let crop_h = bottom - top;
-
-    (left, top, crop_w, crop_h)
-}
-
-/// Crop a grayscale image to the given rectangle.
-fn crop_gray(img: &GrayImage, x: u32, y: u32, w: u32, h: u32) -> GrayImage {
-    DynamicImage::ImageLuma8(img.clone())
-        .crop_imm(x, y, w, h)
-        .into_luma8()
-}
-
-/// Automatically optimize distortion parameters by comparing corrected raw
-/// against the camera's embedded JPEG preview using edge-weighted SSIM.
+/// The ptlens model maps output (corrected) coordinates to source (distorted):
+///   r_src = a*r^4 + b*r^3 + c*r^2 + (1-a-b-c)*r
 ///
-/// Uses coordinate descent with ternary search, alternating parameter order
-/// across passes to avoid getting stuck in local optima.
-///
-/// Returns (a, b, c) distortion coefficients. The caller attaches the focal length.
+/// This is linear in a, b, c, so given matched feature correspondences between
+/// the distorted raw and the corrected preview, we can solve directly.
 pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -> (f64, f64, f64) {
-    let raw_rgb = raw_img.to_rgb8();
-    let target_gray = DynamicImage::ImageRgb8(preview_img.to_rgb8()).into_luma8();
+    let raw_gray = raw_img.to_luma8();
+    let preview_gray = preview_img.to_luma8();
 
-    let max_passes = 10;
-    let ternary_iters = 25;
+    let (w, h) = raw_gray.dimensions();
+    let cx = w as f64 / 2.0;
+    let cy = h as f64 / 2.0;
+    let r_max = (cx * cx + cy * cy).sqrt();
 
-    let pb = ProgressBar::new(max_passes as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{msg} [{bar:40}] pass {pos}/{len}")
-            .unwrap(),
+    // Normalize both images for better matching across different tone curves
+    let raw_norm = histogram_equalize(&raw_gray);
+    let preview_norm = histogram_equalize(&preview_gray);
+
+    eprintln!("    Detecting features...");
+    let raw_corners = detect_harris_corners(&raw_norm, 500);
+    let preview_corners = detect_harris_corners(&preview_norm, 500);
+    eprintln!(
+        "    Found {} raw corners, {} preview corners",
+        raw_corners.len(),
+        preview_corners.len()
     );
-    pb.set_message("Optimizing distortion");
 
-    let mut a = 0.0_f64;
-    let mut b = 0.0_f64;
-    let mut c = 0.0_f64;
+    eprintln!("    Matching features...");
+    let matches = match_features(&raw_norm, &raw_corners, &preview_norm, &preview_corners);
+    eprintln!("    {} matches found", matches.len());
 
-    // Evaluate distortion parameters by:
-    // 1. Applying the correction
-    // 2. Cropping to the valid (non-black) region
-    // 3. Cropping the target to the same region
-    // 4. Comparing with edge-weighted SSIM
-    let evaluate = |a: f64, b: f64, c: f64| -> f64 {
-        let corrected = apply_distortion(&raw_rgb, a, b, c);
-        let (cx, cy, cw, ch) = find_valid_crop(&corrected);
-        if cw < 32 || ch < 32 {
-            return 0.0; // Correction too extreme, almost no valid pixels
-        }
-        let corrected_gray = DynamicImage::ImageRgb8(corrected).into_luma8();
-        let cropped_corrected = crop_gray(&corrected_gray, cx, cy, cw, ch);
-        let cropped_target = crop_gray(&target_gray, cx, cy, cw, ch);
-        distortion_similarity(&cropped_corrected, &cropped_target)
-    };
-
-    // Coarse grid search to find a good starting point
-    let grid_points = [-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3];
-    let mut best_score = f64::NEG_INFINITY;
-    for &ga in &grid_points {
-        let s = evaluate(ga, 0.0, 0.0);
-        if s > best_score {
-            best_score = s;
-            a = ga;
-        }
-    }
-    for &gb in &grid_points {
-        let s = evaluate(a, gb, 0.0);
-        if s > best_score {
-            best_score = s;
-            b = gb;
-        }
-    }
-    for &gc in &grid_points {
-        let s = evaluate(a, b, gc);
-        if s > best_score {
-            best_score = s;
-            c = gc;
-        }
+    if matches.len() < 10 {
+        eprintln!("    WARNING: Too few matches, falling back to zero correction");
+        return (0.0, 0.0, 0.0);
     }
 
-    for pass in 0..max_passes {
-        let prev_a = a;
-        let prev_b = b;
-        let prev_c = c;
+    // Build the linear system from matched points.
+    //
+    // The raw image is distorted, the preview is corrected.
+    // ptlens model: r_src = a*r_out^4 + b*r_out^3 + c*r_out^2 + (1-a-b-c)*r_out
+    //
+    // raw point → distorted position (r_src)
+    // preview point → corrected position (r_out)
+    //
+    // Rearranging:
+    //   r_src - r_out = a*(r_out^4 - r_out) + b*(r_out^3 - r_out) + c*(r_out^2 - r_out)
+    //
+    // This is a linear system A*x = b where x = [a, b, c].
 
-        // Alternate parameter order: forward on even passes, reverse on odd
-        if pass % 2 == 0 {
-            a = ternary_search(|val| evaluate(val, b, c), -0.3, 0.3, ternary_iters);
-            b = ternary_search(|val| evaluate(a, val, c), -0.3, 0.3, ternary_iters);
-            c = ternary_search(|val| evaluate(a, b, val), -0.5, 0.5, ternary_iters);
-        } else {
-            c = ternary_search(|val| evaluate(a, b, val), -0.5, 0.5, ternary_iters);
-            b = ternary_search(|val| evaluate(a, val, c), -0.3, 0.3, ternary_iters);
-            a = ternary_search(|val| evaluate(val, b, c), -0.3, 0.3, ternary_iters);
-        }
+    // First, filter outliers using RANSAC-like approach
+    let inliers = filter_outliers(&matches, cx, cy, r_max);
+    eprintln!("    {} inliers after outlier rejection", inliers.len());
 
-        pb.inc(1);
-
-        let delta = (a - prev_a).abs() + (b - prev_b).abs() + (c - prev_c).abs();
-        if delta < 1e-6 {
-            break;
-        }
+    if inliers.len() < 6 {
+        eprintln!("    WARNING: Too few inliers, falling back to zero correction");
+        return (0.0, 0.0, 0.0);
     }
 
-    pb.finish_with_message("Distortion calibration complete");
+    let n = inliers.len();
+    let mut a_mat = DMatrix::<f64>::zeros(n, 3);
+    let mut b_vec = DVector::<f64>::zeros(n);
 
-    let final_score = evaluate(a, b, c);
-    eprintln!("    Final similarity score: {:.6}", final_score);
+    for (i, &(raw_x, raw_y, prev_x, prev_y)) in inliers.iter().enumerate() {
+        // Compute normalized radial distances
+        let raw_dx = raw_x as f64 - cx;
+        let raw_dy = raw_y as f64 - cy;
+        let r_src = (raw_dx * raw_dx + raw_dy * raw_dy).sqrt() / r_max;
 
-    (a, b, c)
+        let prev_dx = prev_x as f64 - cx;
+        let prev_dy = prev_y as f64 - cy;
+        let r_out = (prev_dx * prev_dx + prev_dy * prev_dy).sqrt() / r_max;
+
+        if r_out < 1e-6 {
+            continue; // Skip center points where division would be unstable
+        }
+
+        let r_out2 = r_out * r_out;
+        let r_out3 = r_out2 * r_out;
+        let r_out4 = r_out3 * r_out;
+
+        a_mat[(i, 0)] = r_out4 - r_out;
+        a_mat[(i, 1)] = r_out3 - r_out;
+        a_mat[(i, 2)] = r_out2 - r_out;
+        b_vec[i] = r_src - r_out;
+    }
+
+    // Solve via least squares: (A^T A) x = A^T b
+    let at_a = a_mat.transpose() * &a_mat;
+    let at_b = a_mat.transpose() * &b_vec;
+
+    match at_a.lu().solve(&at_b) {
+        Some(solution) => {
+            let a = solution[0];
+            let b = solution[1];
+            let c = solution[2];
+
+            // Compute residual to assess fit quality
+            let residual = &a_mat * &solution - &b_vec;
+            let rmse = (residual.dot(&residual) / n as f64).sqrt();
+            eprintln!("    Fit RMSE: {:.6} (normalized radius units)", rmse);
+
+            (a, b, c)
+        }
+        None => {
+            eprintln!("    WARNING: Least squares solve failed, falling back to zero correction");
+            (0.0, 0.0, 0.0)
+        }
+    }
 }
 
-/// Ternary search for the maximum of a unimodal function on [lo, hi].
-fn ternary_search<F>(f: F, mut lo: f64, mut hi: f64, iterations: usize) -> f64
-where
-    F: Fn(f64) -> f64,
-{
-    for _ in 0..iterations {
-        let m1 = lo + (hi - lo) / 3.0;
-        let m2 = hi - (hi - lo) / 3.0;
+/// Simple histogram equalization to normalize brightness/contrast.
+/// This helps match features between the raw decode (flat, low-contrast)
+/// and the camera preview (punchy, contrasty S-curve).
+fn histogram_equalize(img: &GrayImage) -> GrayImage {
+    let (w, h) = img.dimensions();
+    let total = (w * h) as f64;
 
-        if f(m1) < f(m2) {
-            lo = m1;
-        } else {
-            hi = m2;
+    // Build histogram
+    let mut hist = [0u32; 256];
+    for p in img.pixels() {
+        hist[p[0] as usize] += 1;
+    }
+
+    // Build CDF
+    let mut cdf = [0.0_f64; 256];
+    cdf[0] = hist[0] as f64 / total;
+    for i in 1..256 {
+        cdf[i] = cdf[i - 1] + hist[i] as f64 / total;
+    }
+
+    // Map pixels
+    let mut output = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let v = img.get_pixel(x, y)[0] as usize;
+            let mapped = (cdf[v] * 255.0).round().clamp(0.0, 255.0) as u8;
+            output.put_pixel(x, y, image::Luma([mapped]));
         }
     }
 
-    (lo + hi) / 2.0
+    output
+}
+
+/// Detect Harris corners in a grayscale image.
+/// Returns up to `max_corners` strongest corners as (x, y) positions.
+fn detect_harris_corners(img: &GrayImage, max_corners: usize) -> Vec<(u32, u32)> {
+    let (w, h) = img.dimensions();
+    if w < 10 || h < 10 {
+        return Vec::new();
+    }
+
+    // Compute image gradients (Sobel)
+    let mut ix = vec![0.0_f64; (w * h) as usize];
+    let mut iy = vec![0.0_f64; (w * h) as usize];
+
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let idx = (y * w + x) as usize;
+            let p = |dx: i32, dy: i32| -> f64 {
+                img.get_pixel((x as i32 + dx) as u32, (y as i32 + dy) as u32)[0] as f64
+            };
+            ix[idx] = -p(-1, -1) + p(1, -1) - 2.0 * p(-1, 0) + 2.0 * p(1, 0) - p(-1, 1) + p(1, 1);
+            iy[idx] = -p(-1, -1) - 2.0 * p(0, -1) - p(1, -1) + p(-1, 1) + 2.0 * p(0, 1) + p(1, 1);
+        }
+    }
+
+    // Compute Harris response: R = det(M) - k * trace(M)^2
+    // where M = sum over window of [[Ix^2, Ix*Iy], [Ix*Iy, Iy^2]]
+    let k = 0.04;
+    let win = 3i32; // window half-size
+    let mut responses: Vec<(f64, u32, u32)> = Vec::new();
+
+    // Skip edges of image to avoid border artifacts and ensure patches fit
+    let margin = 16u32;
+    for y in margin..h - margin {
+        for x in margin..w - margin {
+            let mut sxx = 0.0_f64;
+            let mut syy = 0.0_f64;
+            let mut sxy = 0.0_f64;
+
+            for dy in -win..=win {
+                for dx in -win..=win {
+                    let idx = ((y as i32 + dy) as u32 * w + (x as i32 + dx) as u32) as usize;
+                    sxx += ix[idx] * ix[idx];
+                    syy += iy[idx] * iy[idx];
+                    sxy += ix[idx] * iy[idx];
+                }
+            }
+
+            let det = sxx * syy - sxy * sxy;
+            let trace = sxx + syy;
+            let r = det - k * trace * trace;
+
+            if r > 0.0 {
+                responses.push((r, x, y));
+            }
+        }
+    }
+
+    // Sort by response strength (strongest first)
+    responses.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+    // Non-maximum suppression: keep only the strongest corner within a radius
+    let suppress_radius = 8u32;
+    let mut corners = Vec::new();
+
+    for &(_, x, y) in &responses {
+        let too_close = corners.iter().any(|&(cx, cy): &(u32, u32)| {
+            let dx = x as i32 - cx as i32;
+            let dy = y as i32 - cy as i32;
+            (dx * dx + dy * dy) < (suppress_radius * suppress_radius) as i32
+        });
+
+        if !too_close {
+            corners.push((x, y));
+            if corners.len() >= max_corners {
+                break;
+            }
+        }
+    }
+
+    corners
+}
+
+/// Match features between two images using normalized cross-correlation (NCC)
+/// on local patches. NCC is invariant to linear brightness/contrast changes.
+///
+/// Returns matched pairs: (raw_x, raw_y, preview_x, preview_y).
+fn match_features(
+    raw: &GrayImage,
+    raw_corners: &[(u32, u32)],
+    preview: &GrayImage,
+    preview_corners: &[(u32, u32)],
+) -> Vec<(u32, u32, u32, u32)> {
+    let patch_half = 12i32; // 25x25 patches
+
+    let mut matches = Vec::new();
+
+    // For each raw corner, find the best matching preview corner
+    for &(rx, ry) in raw_corners {
+        let mut best_ncc = -1.0_f64;
+        let mut second_ncc = -1.0_f64;
+        let mut best_match = (0u32, 0u32);
+
+        for &(px, py) in preview_corners {
+            // Only consider matches within a reasonable search radius
+            // (distortion shouldn't move points more than ~10% of image size)
+            let dx = rx as i32 - px as i32;
+            let dy = ry as i32 - py as i32;
+            let dist2 = dx * dx + dy * dy;
+            let max_dist = (raw.width().max(raw.height()) as i32) / 5;
+            if dist2 > max_dist * max_dist {
+                continue;
+            }
+
+            let ncc = compute_ncc(raw, rx, ry, preview, px, py, patch_half);
+
+            if ncc > best_ncc {
+                second_ncc = best_ncc;
+                best_ncc = ncc;
+                best_match = (px, py);
+            } else if ncc > second_ncc {
+                second_ncc = ncc;
+            }
+        }
+
+        // Lowe's ratio test: best match must be significantly better than second best
+        if best_ncc > 0.6 && (second_ncc < 0.0 || best_ncc > second_ncc * 1.2) {
+            matches.push((rx, ry, best_match.0, best_match.1));
+        }
+    }
+
+    matches
+}
+
+/// Compute normalized cross-correlation between two patches.
+/// Returns a value in [-1, 1] where 1 = perfect match.
+/// NCC is invariant to linear brightness and contrast differences.
+fn compute_ncc(
+    img_a: &GrayImage,
+    ax: u32,
+    ay: u32,
+    img_b: &GrayImage,
+    bx: u32,
+    by: u32,
+    half: i32,
+) -> f64 {
+    let mut sum_a = 0.0_f64;
+    let mut sum_b = 0.0_f64;
+    let mut n = 0.0_f64;
+
+    // Compute means
+    for dy in -half..=half {
+        for dx in -half..=half {
+            let va = img_a.get_pixel((ax as i32 + dx) as u32, (ay as i32 + dy) as u32)[0] as f64;
+            let vb = img_b.get_pixel((bx as i32 + dx) as u32, (by as i32 + dy) as u32)[0] as f64;
+            sum_a += va;
+            sum_b += vb;
+            n += 1.0;
+        }
+    }
+
+    let mean_a = sum_a / n;
+    let mean_b = sum_b / n;
+
+    // Compute NCC
+    let mut cov = 0.0_f64;
+    let mut var_a = 0.0_f64;
+    let mut var_b = 0.0_f64;
+
+    for dy in -half..=half {
+        for dx in -half..=half {
+            let va = img_a.get_pixel((ax as i32 + dx) as u32, (ay as i32 + dy) as u32)[0] as f64
+                - mean_a;
+            let vb = img_b.get_pixel((bx as i32 + dx) as u32, (by as i32 + dy) as u32)[0] as f64
+                - mean_b;
+            cov += va * vb;
+            var_a += va * va;
+            var_b += vb * vb;
+        }
+    }
+
+    let denom = (var_a * var_b).sqrt();
+    if denom < 1e-10 {
+        return 0.0;
+    }
+
+    cov / denom
+}
+
+/// Filter outlier matches using a simple median-based approach.
+///
+/// For each match, compute the radial displacement ratio. Outliers will have
+/// ratios that deviate significantly from the median.
+fn filter_outliers(
+    matches: &[(u32, u32, u32, u32)],
+    cx: f64,
+    cy: f64,
+    r_max: f64,
+) -> Vec<(u32, u32, u32, u32)> {
+    if matches.len() < 4 {
+        return matches.to_vec();
+    }
+
+    // Compute radial displacement ratio for each match
+    let mut ratios: Vec<(f64, usize)> = Vec::new();
+    for (i, &(rx, ry, px, py)) in matches.iter().enumerate() {
+        let r_raw = ((rx as f64 - cx).powi(2) + (ry as f64 - cy).powi(2)).sqrt() / r_max;
+        let r_prev = ((px as f64 - cx).powi(2) + (py as f64 - cy).powi(2)).sqrt() / r_max;
+
+        if r_prev > 0.05 {
+            // Skip center points where ratio is unstable
+            ratios.push((r_raw / r_prev, i));
+        }
+    }
+
+    if ratios.is_empty() {
+        return matches.to_vec();
+    }
+
+    // Find median ratio
+    ratios.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let median = ratios[ratios.len() / 2].0;
+
+    // Keep matches within 3 * MAD (median absolute deviation) of the median
+    let mut deviations: Vec<f64> = ratios.iter().map(|(r, _)| (r - median).abs()).collect();
+    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mad = deviations[deviations.len() / 2];
+    let threshold = (3.0 * mad).max(0.02); // At least 2% tolerance
+
+    let inlier_indices: Vec<usize> = ratios
+        .iter()
+        .filter(|(r, _)| (r - median).abs() <= threshold)
+        .map(|(_, i)| *i)
+        .collect();
+
+    inlier_indices.iter().map(|&i| matches[i]).collect()
 }
