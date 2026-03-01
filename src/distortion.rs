@@ -134,22 +134,66 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
         return (0.0, 0.0, 0.0);
     }
 
+    // Log the radial distribution of inliers so we can assess coverage
+    let mut radial_bins = [0u32; 5]; // 0-0.2, 0.2-0.4, 0.4-0.6, 0.6-0.8, 0.8-1.0
+    for &(rx, ry, _, _) in &inliers {
+        let r = ((rx as f64 - cx).powi(2) + (ry as f64 - cy).powi(2)).sqrt() / r_max;
+        let bin = (r * 5.0).min(4.0) as usize;
+        radial_bins[bin] += 1;
+    }
+    eprintln!(
+        "    Radial distribution: center={}, mid-inner={}, mid={}, mid-outer={}, edge={}",
+        radial_bins[0], radial_bins[1], radial_bins[2], radial_bins[3], radial_bins[4]
+    );
+
+    // Step 1: Estimate the scale difference between raw and preview.
+    //
+    // The raw decode (raw_to_srgb) often has a slightly different field of view
+    // than the camera's embedded JPEG preview (which may crop to the "active area").
+    // Even a 2% FOV difference produces large, oscillating polynomial coefficients
+    // if not accounted for. We estimate the scale from near-center matches where
+    // distortion is minimal.
+    let mut scale_ratios: Vec<f64> = Vec::new();
+    for &(raw_x, raw_y, prev_x, prev_y) in &inliers {
+        let r_raw = ((raw_x as f64 - cx).powi(2) + (raw_y as f64 - cy).powi(2)).sqrt() / r_max;
+        let r_prev = ((prev_x as f64 - cx).powi(2) + (prev_y as f64 - cy).powi(2)).sqrt() / r_max;
+        // Only use inner matches (r < 0.3) where distortion is negligible,
+        // so the ratio reflects pure scale difference, not distortion.
+        if r_prev > 0.05 && r_prev < 0.3 {
+            scale_ratios.push(r_raw / r_prev);
+        }
+    }
+    scale_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let scale = if !scale_ratios.is_empty() {
+        scale_ratios[scale_ratios.len() / 2] // median
+    } else {
+        1.0
+    };
+    eprintln!("    Estimated raw/preview scale factor: {:.6}", scale);
+
+    // Step 2: Build the linear system with scale-corrected radii.
+    //
+    // After dividing r_raw by the scale factor, the remaining difference
+    // between r_raw_corrected and r_preview is purely distortion.
+    //
+    // r_raw/scale - r_prev = a*(r_prev^4 - r_prev) + b*(r_prev^3 - r_prev) + c*(r_prev^2 - r_prev)
     let n = inliers.len();
     let mut a_mat = DMatrix::<f64>::zeros(n, 3);
     let mut b_vec = DVector::<f64>::zeros(n);
+    let mut w_mat = DMatrix::<f64>::zeros(n, n);
 
     for (i, &(raw_x, raw_y, prev_x, prev_y)) in inliers.iter().enumerate() {
-        // Compute normalized radial distances
         let raw_dx = raw_x as f64 - cx;
         let raw_dy = raw_y as f64 - cy;
         let r_src = (raw_dx * raw_dx + raw_dy * raw_dy).sqrt() / r_max;
+        let r_src_scaled = r_src / scale; // Remove scale difference
 
         let prev_dx = prev_x as f64 - cx;
         let prev_dy = prev_y as f64 - cy;
         let r_out = (prev_dx * prev_dx + prev_dy * prev_dy).sqrt() / r_max;
 
         if r_out < 1e-6 {
-            continue; // Skip center points where division would be unstable
+            continue;
         }
 
         let r_out2 = r_out * r_out;
@@ -159,23 +203,37 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
         a_mat[(i, 0)] = r_out4 - r_out;
         a_mat[(i, 1)] = r_out3 - r_out;
         a_mat[(i, 2)] = r_out2 - r_out;
-        b_vec[i] = r_src - r_out;
+        b_vec[i] = r_src_scaled - r_out;
+
+        // Weight by radial position — outer points matter more for distortion.
+        let weight = 1.0 + 4.0 * r_out * r_out;
+        w_mat[(i, i)] = weight;
     }
 
-    // Solve via least squares: (A^T A) x = A^T b
-    let at_a = a_mat.transpose() * &a_mat;
-    let at_b = a_mat.transpose() * &b_vec;
+    // Weighted least squares with Tikhonov regularization:
+    //   minimize ||W^(1/2) * (A*x - b)||^2 + lambda * ||x||^2
+    //
+    // Strong regularization pulls coefficients toward zero, preventing the
+    // polynomial from overfitting noise in feature positions. Typical lens
+    // distortion coefficients are in the -0.05 to 0.05 range; without
+    // sufficient regularization, the solver produces large oscillating
+    // coefficients that create wavy corrections.
+    let lambda = 0.5;
+    let at_w = a_mat.transpose() * &w_mat;
+    let at_w_a = &at_w * &a_mat + lambda * DMatrix::<f64>::identity(3, 3);
+    let at_w_b = &at_w * &b_vec;
 
-    match at_a.lu().solve(&at_b) {
+    match at_w_a.lu().solve(&at_w_b) {
         Some(solution) => {
             let a = solution[0];
             let b = solution[1];
             let c = solution[2];
+            let d = 1.0 - a - b - c;
 
-            // Compute residual to assess fit quality
             let residual = &a_mat * &solution - &b_vec;
             let rmse = (residual.dot(&residual) / n as f64).sqrt();
             eprintln!("    Fit RMSE: {:.6} (normalized radius units)", rmse);
+            eprintln!("    d (linear term) = {:.6} (should be close to 1.0)", d);
 
             (a, b, c)
         }
