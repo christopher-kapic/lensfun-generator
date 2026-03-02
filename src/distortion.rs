@@ -210,47 +210,103 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
         w_mat[(i, i)] = weight;
     }
 
-    // Weighted least squares with Tikhonov regularization:
-    //   minimize ||W^(1/2) * (A*x - b)||^2 + lambda * ||x||^2
+    // Progressive fitting: start with the simplest model (c only = r^2,
+    // pure barrel/pincushion), then add b (r^3) and a (r^4) only if they
+    // meaningfully improve the fit. This prevents higher-order terms from
+    // introducing waviness when they're not justified by the data.
     //
-    // Strong regularization pulls coefficients toward zero, preventing the
-    // polynomial from overfitting noise in feature positions. Typical lens
-    // distortion coefficients are in the -0.05 to 0.05 range; without
-    // sufficient regularization, the solver produces large oscillating
-    // coefficients that create wavy corrections.
-    let lambda = 0.5;
-    let at_w = a_mat.transpose() * &w_mat;
-    let at_w_a = &at_w * &a_mat + lambda * DMatrix::<f64>::identity(3, 3);
-    let at_w_b = &at_w * &b_vec;
+    // Each stage uses weighted least squares with mild regularization.
+    let lambda = 0.1;
+
+    // Stage 1: fit c only (column 2 of a_mat)
+    let col_c = a_mat.column(2).clone_owned();
+    let col_c_mat = DMatrix::from_column_slice(n, 1, col_c.as_slice());
+    let (c_raw, rmse_c) = solve_regularized(&col_c_mat, &b_vec, &w_mat, lambda);
+    let c_val = c_raw[0];
+    eprintln!("    Stage 1 (c only):  c={:.6}, RMSE={:.6}", -c_val, rmse_c);
+
+    // Stage 2: fit b + c (columns 1,2)
+    let cols_bc = a_mat.columns(1, 2).clone_owned();
+    let (bc_raw, rmse_bc) = solve_regularized(&cols_bc, &b_vec, &w_mat, lambda);
+    let b_val = bc_raw[0];
+    let c_val_2 = bc_raw[1];
+    eprintln!(
+        "    Stage 2 (b+c):    b={:.6}, c={:.6}, RMSE={:.6}",
+        -b_val, -c_val_2, rmse_bc
+    );
+
+    // Stage 3: fit a + b + c (all columns)
+    let (abc_raw, rmse_abc) = solve_regularized(&a_mat, &b_vec, &w_mat, lambda);
+    let a_val = abc_raw[0];
+    let b_val_3 = abc_raw[1];
+    let c_val_3 = abc_raw[2];
+    eprintln!(
+        "    Stage 3 (a+b+c): a={:.6}, b={:.6}, c={:.6}, RMSE={:.6}",
+        -a_val, -b_val_3, -c_val_3, rmse_abc
+    );
+
+    // Choose the simplest model that fits well enough.
+    // Use a high threshold (50%) because the b and a terms tend to absorb
+    // residual scale error and feature matching noise rather than real
+    // higher-order distortion. For most lenses, c-only (simple barrel/pincushion)
+    // is sufficient and produces the cleanest correction.
+    let (a_final, b_final, c_final, stage);
+    let improvement_bc = (rmse_c - rmse_bc) / rmse_c;
+    let improvement_abc = (rmse_bc - rmse_abc) / rmse_bc;
+
+    if improvement_bc > 0.50 && improvement_abc > 0.50 {
+        // All three terms strongly justified
+        a_final = -a_val;
+        b_final = -b_val_3;
+        c_final = -c_val_3;
+        stage = 3;
+    } else if improvement_bc > 0.50 {
+        // b+c strongly justified, a not needed
+        a_final = 0.0;
+        b_final = -b_val;
+        c_final = -c_val_2;
+        stage = 2;
+    } else {
+        // c only — the dominant distortion term for most lenses
+        a_final = 0.0;
+        b_final = 0.0;
+        c_final = -c_val;
+        stage = 1;
+    }
+
+    let d = 1.0 - a_final - b_final - c_final;
+    eprintln!(
+        "    Selected stage {} (RMSE improvement: b→{:.1}%, a→{:.1}%)",
+        stage,
+        improvement_bc * 100.0,
+        improvement_abc * 100.0
+    );
+    eprintln!("    d (linear term) = {:.6} (should be close to 1.0)", d);
+
+    (a_final, b_final, c_final)
+}
+
+/// Solve a weighted least squares problem with Tikhonov regularization.
+/// Returns (solution_vector, rmse).
+fn solve_regularized(
+    a: &DMatrix<f64>,
+    b: &DVector<f64>,
+    w: &DMatrix<f64>,
+    lambda: f64,
+) -> (DVector<f64>, f64) {
+    let ncols = a.ncols();
+    let nrows = a.nrows();
+    let at_w = a.transpose() * w;
+    let at_w_a = &at_w * a + lambda * DMatrix::<f64>::identity(ncols, ncols);
+    let at_w_b = &at_w * b;
 
     match at_w_a.lu().solve(&at_w_b) {
         Some(solution) => {
-            let a_raw = solution[0];
-            let b_raw = solution[1];
-            let c_raw = solution[2];
-
-            let residual = &a_mat * &solution - &b_vec;
-            let rmse = (residual.dot(&residual) / n as f64).sqrt();
-            eprintln!("    Fit RMSE: {:.6} (normalized radius units)", rmse);
-
-            // Our linear system fits the mapping: corrected → distorted.
-            // But we measured the displacement from the camera's correction
-            // perspective. The lensfun model uses the SAME convention
-            // (corrected → distorted), but our feature correspondences give
-            // us the camera's correction direction, so we negate to get the
-            // coefficients that UNDO the raw distortion.
-            let a = -a_raw;
-            let b = -b_raw;
-            let c = -c_raw;
-            let d = 1.0 - a - b - c;
-            eprintln!("    d (linear term) = {:.6} (should be close to 1.0)", d);
-
-            (a, b, c)
+            let residual = a * &solution - b;
+            let rmse = (residual.dot(&residual) / nrows as f64).sqrt();
+            (solution, rmse)
         }
-        None => {
-            eprintln!("    WARNING: Least squares solve failed, falling back to zero correction");
-            (0.0, 0.0, 0.0)
-        }
+        None => (DVector::zeros(ncols), f64::MAX),
     }
 }
 
