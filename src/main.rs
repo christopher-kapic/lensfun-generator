@@ -3,6 +3,7 @@ mod exif;
 mod image_util;
 mod models;
 mod similarity;
+mod tca;
 mod vignetting;
 mod xml;
 
@@ -54,6 +55,7 @@ fn main() -> Result<()> {
     // Discover files
     let distortion_dir = dir.join("distortion");
     let vignette_dir = dir.join("vignette");
+    let tca_dir = dir.join("tca");
 
     let distortion_files = if distortion_dir.is_dir() {
         find_raw_files(&distortion_dir)?
@@ -67,9 +69,15 @@ fn main() -> Result<()> {
         Vec::new()
     };
 
-    if distortion_files.is_empty() && vignette_files.is_empty() {
+    let tca_files = if tca_dir.is_dir() {
+        find_raw_files(&tca_dir)?
+    } else {
+        Vec::new()
+    };
+
+    if distortion_files.is_empty() && vignette_files.is_empty() && tca_files.is_empty() {
         bail!(
-            "No RAW files found. Expected distortion/ and/or vignette/ subdirectories in {}",
+            "No RAW files found. Expected distortion/, vignette/, and/or tca/ subdirectories in {}",
             dir.display()
         );
     }
@@ -78,6 +86,7 @@ fn main() -> Result<()> {
     let first_file = distortion_files
         .first()
         .or(vignette_files.first())
+        .or(tca_files.first())
         .unwrap();
     let exif_data = read_exif(first_file).unwrap_or_else(|e| {
         eprintln!("Warning: Could not read EXIF data: {e}");
@@ -201,11 +210,37 @@ fn main() -> Result<()> {
         }
     }
 
+    // TCA calibration
+    let mut tca_params = Vec::new();
+
+    if !tca_files.is_empty() {
+        eprintln!(
+            "\nCalibrating TCA ({} image{})...",
+            tca_files.len(),
+            if tca_files.len() == 1 { "" } else { "s" }
+        );
+        for file in &tca_files {
+            let tca_exif = read_exif(file).ok();
+            let focal = tca_exif.as_ref().and_then(|e| e.focal_length).unwrap_or(0.0);
+
+            eprintln!(
+                "  Analyzing {} (f={}mm)...",
+                file.file_name().unwrap_or_default().to_string_lossy(),
+                focal
+            );
+
+            let params = tca::analyze_tca(file, focal)?;
+            eprintln!("    vr={:.6}, vb={:.6}", params.vr, params.vb);
+            tca_params.push(params);
+        }
+    }
+
     // Generate XML
     let project = CalibrationProject {
         lens_info,
         distortion_params,
         vignetting_params,
+        tca_params,
     };
 
     let xml_output = xml::generate_xml(&project)?;

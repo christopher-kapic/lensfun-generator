@@ -39,8 +39,9 @@ pub fn generate_xml(project: &CalibrationProject) -> Result<String> {
     };
     write_text_element(&mut writer, "type", lens_type_str)?;
 
-    let has_calibration =
-        !project.distortion_params.is_empty() || !project.vignetting_params.is_empty();
+    let has_calibration = !project.distortion_params.is_empty()
+        || !project.vignetting_params.is_empty()
+        || !project.tca_params.is_empty();
 
     if has_calibration {
         writer
@@ -68,6 +69,17 @@ pub fn generate_xml(project: &CalibrationProject) -> Result<String> {
             elem.push_attribute(("k1", &*format!("{}", vig.k1)));
             elem.push_attribute(("k2", &*format!("{}", vig.k2)));
             elem.push_attribute(("k3", &*format!("{}", vig.k3)));
+            writer
+                .write_event(Event::Empty(elem))
+                .context("XML write error")?;
+        }
+
+        for tca in &project.tca_params {
+            let mut elem = BytesStart::new("tca");
+            elem.push_attribute(("model", "poly3"));
+            elem.push_attribute(("focal", &*format!("{}", tca.focal_length)));
+            elem.push_attribute(("vr", &*format!("{:.6}", tca.vr)));
+            elem.push_attribute(("vb", &*format!("{:.6}", tca.vb)));
             writer
                 .write_event(Event::Empty(elem))
                 .context("XML write error")?;

@@ -39,10 +39,20 @@ pub struct VignettingParams {
     pub aperture: f64,
 }
 
+/// TCA (Transverse Chromatic Aberration) correction parameters (poly3 model)
+/// Red and blue channel radial scaling factors relative to green.
+#[derive(Clone, Debug)]
+pub struct TcaParams {
+    pub vr: f64,
+    pub vb: f64,
+    pub focal_length: f64,
+}
+
 /// Top-level calibration project containing all data needed for XML generation
 #[derive(Clone, Debug)]
 pub struct CalibrationProject {
     pub lens_info: LensInfo,
     pub distortion_params: Vec<DistortionParams>,
     pub vignetting_params: Vec<VignettingParams>,
+    pub tca_params: Vec<TcaParams>,
 }

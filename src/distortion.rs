@@ -210,76 +210,55 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
         w_mat[(i, i)] = weight;
     }
 
-    // Progressive fitting: start with the simplest model (c only = r^2,
-    // pure barrel/pincushion), then add b (r^3) and a (r^4) only if they
-    // meaningfully improve the fit. This prevents higher-order terms from
-    // introducing waviness when they're not justified by the data.
+    // Two-stage fitting: first determine c (the dominant barrel/pincushion
+    // term), then lock it and fit a + b for any residual higher-order
+    // distortion. This prevents the higher-order terms from destabilizing
+    // the primary correction.
     //
     // Each stage uses weighted least squares with mild regularization.
     let lambda = 0.1;
 
-    // Stage 1: fit c only (column 2 of a_mat)
+    // Stage 1: fit c only (column 2 of a_mat) — this captures the dominant
+    // barrel/pincushion distortion and is locked for subsequent fitting.
     let col_c = a_mat.column(2).clone_owned();
     let col_c_mat = DMatrix::from_column_slice(n, 1, col_c.as_slice());
     let (c_raw, rmse_c) = solve_regularized(&col_c_mat, &b_vec, &w_mat, lambda);
     let c_val = c_raw[0];
-    eprintln!("    Stage 1 (c only):  c={:.6}, RMSE={:.6}", -c_val, rmse_c);
+    let c_final = -c_val;
+    eprintln!("    Stage 1 (c only):  c={:.6}, RMSE={:.6}", c_final, rmse_c);
 
-    // Stage 2: fit b + c (columns 1,2)
-    let cols_bc = a_mat.columns(1, 2).clone_owned();
-    let (bc_raw, rmse_bc) = solve_regularized(&cols_bc, &b_vec, &w_mat, lambda);
-    let b_val = bc_raw[0];
-    let c_val_2 = bc_raw[1];
+    // Stage 2: fit a + b with c locked. Subtract c's contribution from the
+    // RHS so we solve for the residual that a and b must explain.
+    let b_residual = &b_vec - c_val * &col_c;
+    let cols_ab = a_mat.columns(0, 2).clone_owned(); // columns 0 (a) and 1 (b)
+    let (ab_raw, rmse_ab) = solve_regularized(&cols_ab, &b_residual, &w_mat, lambda);
+    let a_val = ab_raw[0];
+    let b_val = ab_raw[1];
     eprintln!(
-        "    Stage 2 (b+c):    b={:.6}, c={:.6}, RMSE={:.6}",
-        -b_val, -c_val_2, rmse_bc
-    );
-
-    // Stage 3: fit a + b + c (all columns)
-    let (abc_raw, rmse_abc) = solve_regularized(&a_mat, &b_vec, &w_mat, lambda);
-    let a_val = abc_raw[0];
-    let b_val_3 = abc_raw[1];
-    let c_val_3 = abc_raw[2];
-    eprintln!(
-        "    Stage 3 (a+b+c): a={:.6}, b={:.6}, c={:.6}, RMSE={:.6}",
-        -a_val, -b_val_3, -c_val_3, rmse_abc
+        "    Stage 2 (a+b|c):  a={:.6}, b={:.6}, c={:.6}, RMSE={:.6}",
+        -a_val, -b_val, c_final, rmse_ab
     );
 
     // Choose the simplest model that fits well enough.
-    // Use a high threshold (50%) because the b and a terms tend to absorb
-    // residual scale error and feature matching noise rather than real
-    // higher-order distortion. For most lenses, c-only (simple barrel/pincushion)
-    // is sufficient and produces the cleanest correction.
-    let (a_final, b_final, c_final, stage);
-    let improvement_bc = (rmse_c - rmse_bc) / rmse_c;
-    let improvement_abc = (rmse_bc - rmse_abc) / rmse_bc;
+    // Only add a and b if they meaningfully improve on c alone (>50% RMSE reduction).
+    let (a_final, b_final, stage);
+    let improvement_ab = if rmse_c > 1e-12 { (rmse_c - rmse_ab) / rmse_c } else { 0.0 };
 
-    if improvement_bc > 0.50 && improvement_abc > 0.50 {
-        // All three terms strongly justified
+    if improvement_ab > 0.50 {
         a_final = -a_val;
-        b_final = -b_val_3;
-        c_final = -c_val_3;
-        stage = 3;
-    } else if improvement_bc > 0.50 {
-        // b+c strongly justified, a not needed
-        a_final = 0.0;
         b_final = -b_val;
-        c_final = -c_val_2;
         stage = 2;
     } else {
-        // c only — the dominant distortion term for most lenses
         a_final = 0.0;
         b_final = 0.0;
-        c_final = -c_val;
         stage = 1;
     }
 
     let d = 1.0 - a_final - b_final - c_final;
     eprintln!(
-        "    Selected stage {} (RMSE improvement: b→{:.1}%, a→{:.1}%)",
+        "    Selected stage {} (a+b improvement: {:.1}%)",
         stage,
-        improvement_bc * 100.0,
-        improvement_abc * 100.0
+        improvement_ab * 100.0
     );
     eprintln!("    d (linear term) = {:.6} (should be close to 1.0)", d);
 

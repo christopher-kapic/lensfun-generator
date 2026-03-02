@@ -9,6 +9,7 @@ const RAW_EXTENSIONS: &[&str] = &[
 ];
 
 const MAX_DIM: u32 = 720;
+const TCA_MAX_DIM: u32 = 1440;
 
 pub fn is_raw_file(path: &Path) -> bool {
     path.extension()
@@ -38,6 +39,15 @@ pub fn load_camera_preview(path: &Path) -> Result<DynamicImage> {
             )
         })?;
     Ok(resize(img, MAX_DIM))
+}
+
+/// Load raw sensor data at higher resolution for TCA analysis (1440px max).
+/// TCA shifts are sub-pixel, so more pixels = better precision.
+pub fn load_raw_for_tca(path: &Path) -> Result<DynamicImage> {
+    let params = RawDecodeParams::default();
+    let img = rawler::analyze::raw_to_srgb(path, &params)
+        .with_context(|| format!("Failed to decode RAW file: {}", path.display()))?;
+    Ok(resize(img, TCA_MAX_DIM))
 }
 
 /// Find all RAW files in a directory.
