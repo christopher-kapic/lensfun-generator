@@ -16,7 +16,7 @@ use crate::models::VignettingParams;
 ///
 /// Samples average brightness at concentric rings from center to corners,
 /// then fits the polynomial using least squares.
-pub fn analyze_vignetting(path: &Path, focal_length: f64, aperture: f64) -> Result<VignettingParams> {
+pub fn analyze_vignetting(path: &Path, focal_length: f64, aperture: f64, distance: f64) -> Result<VignettingParams> {
     if !path.exists() {
         bail!("File not found: {}", path.display());
     }
@@ -112,5 +112,6 @@ pub fn analyze_vignetting(path: &Path, focal_length: f64, aperture: f64) -> Resu
         k3: solution[2],
         focal_length,
         aperture,
+        distance,
     })
 }

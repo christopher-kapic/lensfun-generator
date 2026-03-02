@@ -93,6 +93,7 @@ fn main() -> Result<()> {
         crate::exif::ExifData {
             focal_length: None,
             aperture: None,
+            focus_distance: None,
             lens_model: None,
             camera_maker: None,
             camera_model: None,
@@ -193,15 +194,17 @@ fn main() -> Result<()> {
             let vig_exif = read_exif(file).ok();
             let focal = vig_exif.as_ref().and_then(|e| e.focal_length).unwrap_or(0.0);
             let aperture = vig_exif.as_ref().and_then(|e| e.aperture).unwrap_or(0.0);
+            let distance = vig_exif.as_ref().and_then(|e| e.focus_distance).unwrap_or(10.0);
 
             eprintln!(
-                "  Analyzing {} (f={}mm, F/{})...",
+                "  Analyzing {} (f={}mm, F/{}, d={}m)...",
                 file.file_name().unwrap_or_default().to_string_lossy(),
                 focal,
-                aperture
+                aperture,
+                distance
             );
 
-            let params = vignetting::analyze_vignetting(file, focal, aperture)?;
+            let params = vignetting::analyze_vignetting(file, focal, aperture, distance)?;
             eprintln!(
                 "    k1={:.6}, k2={:.6}, k3={:.6}",
                 params.k1, params.k2, params.k3

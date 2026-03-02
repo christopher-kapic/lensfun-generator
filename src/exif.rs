@@ -7,6 +7,7 @@ use std::path::Path;
 pub struct ExifData {
     pub focal_length: Option<f64>,
     pub aperture: Option<f64>,
+    pub focus_distance: Option<f64>,
     pub lens_model: Option<String>,
     pub camera_maker: Option<String>,
     pub camera_model: Option<String>,
@@ -36,6 +37,13 @@ pub fn read_exif(path: &Path) -> Result<ExifData> {
             _ => None,
         });
 
+    let focus_distance = exif
+        .get_field(exif::Tag::SubjectDistance, exif::In::PRIMARY)
+        .and_then(|f| match &f.value {
+            exif::Value::Rational(v) if !v.is_empty() => Some(v[0].to_f64()),
+            _ => None,
+        });
+
     let lens_model = exif
         .get_field(exif::Tag::LensModel, exif::In::PRIMARY)
         .map(|f| f.display_value().to_string().trim_matches('"').to_string());
@@ -51,6 +59,7 @@ pub fn read_exif(path: &Path) -> Result<ExifData> {
     Ok(ExifData {
         focal_length,
         aperture,
+        focus_distance,
         lens_model,
         camera_maker,
         camera_model,

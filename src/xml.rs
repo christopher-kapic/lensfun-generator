@@ -65,7 +65,7 @@ pub fn generate_xml(project: &CalibrationProject) -> Result<String> {
             elem.push_attribute(("model", "pa"));
             elem.push_attribute(("focal", &*format!("{}", vig.focal_length)));
             elem.push_attribute(("aperture", &*format!("{}", vig.aperture)));
-            elem.push_attribute(("distance", "10"));
+            elem.push_attribute(("distance", &*format!("{}", vig.distance)));
             elem.push_attribute(("k1", &*format!("{}", vig.k1)));
             elem.push_attribute(("k2", &*format!("{}", vig.k2)));
             elem.push_attribute(("k3", &*format!("{}", vig.k3)));

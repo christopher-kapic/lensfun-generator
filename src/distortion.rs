@@ -227,28 +227,28 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
 
     // Stage 2: apply c correction to the raw image, then re-detect and
     // re-match features against the preview to find residual distortion.
+    // Fit b only (the r^3 term).
     eprintln!("    Applying c correction to raw image...");
-    let corrected_rgb = apply_distortion(&raw_img.to_rgb8(), 0.0, 0.0, c_final);
-    let corrected_gray = histogram_equalize(&DynamicImage::ImageRgb8(corrected_rgb).to_luma8());
+    let c_corrected_rgb = apply_distortion(&raw_img.to_rgb8(), 0.0, 0.0, c_final);
+    let c_corrected_gray = histogram_equalize(&DynamicImage::ImageRgb8(c_corrected_rgb).to_luma8());
 
     eprintln!("    Detecting features on c-corrected image...");
-    let corrected_corners = detect_harris_corners(&corrected_gray, 500);
+    let c_corrected_corners = detect_harris_corners(&c_corrected_gray, 500);
     eprintln!(
         "    Found {} corrected corners, {} preview corners",
-        corrected_corners.len(),
+        c_corrected_corners.len(),
         preview_corners.len()
     );
 
     eprintln!("    Matching c-corrected image to preview...");
-    let stage2_matches = match_features(&corrected_gray, &corrected_corners, &preview_norm, &preview_corners);
+    let stage2_matches = match_features(&c_corrected_gray, &c_corrected_corners, &preview_norm, &preview_corners);
     eprintln!("    {} matches found", stage2_matches.len());
 
-    let (a_final, b_final) = if stage2_matches.len() >= 10 {
+    let b_final = if stage2_matches.len() >= 10 {
         let stage2_inliers = filter_outliers(&stage2_matches, cx, cy, r_max);
         eprintln!("    {} inliers after outlier rejection", stage2_inliers.len());
 
         if stage2_inliers.len() >= 6 {
-            // Estimate scale for the c-corrected image vs preview
             let mut scale2_ratios: Vec<f64> = Vec::new();
             for &(corr_x, corr_y, prev_x, prev_y) in &stage2_inliers {
                 let r_corr = ((corr_x as f64 - cx).powi(2) + (corr_y as f64 - cy).powi(2)).sqrt() / r_max;
@@ -265,9 +265,9 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
             };
             eprintln!("    Residual scale factor: {:.6}", scale2);
 
-            // Build linear system for a and b only (c is already applied)
+            // Build linear system for b only (c is already applied)
             let n2 = stage2_inliers.len();
-            let mut a_mat2 = DMatrix::<f64>::zeros(n2, 2);
+            let mut b_mat2 = DMatrix::<f64>::zeros(n2, 1);
             let mut b_vec2 = DVector::<f64>::zeros(n2);
             let mut w_mat2 = DMatrix::<f64>::zeros(n2, n2);
 
@@ -281,51 +281,139 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
                 }
 
                 let r_out3 = r_out * r_out * r_out;
-                let r_out4 = r_out3 * r_out;
 
-                a_mat2[(i, 0)] = r_out4 - r_out; // a term
-                a_mat2[(i, 1)] = r_out3 - r_out; // b term
+                b_mat2[(i, 0)] = r_out3 - r_out; // b term
                 b_vec2[i] = r_src_scaled - r_out;
 
                 let weight = 1.0 + 4.0 * r_out * r_out;
                 w_mat2[(i, i)] = weight;
             }
 
-            let (ab_raw, rmse_ab) = solve_regularized(&a_mat2, &b_vec2, &w_mat2, lambda);
-            let a_candidate = -ab_raw[0];
-            let b_candidate = -ab_raw[1];
+            let (b_raw, rmse_b) = solve_regularized(&b_mat2, &b_vec2, &w_mat2, lambda);
+            let b_candidate = -b_raw[0];
             eprintln!(
-                "    Stage 2 (a+b|c):  a={:.6}, b={:.6}, RMSE={:.6}",
-                a_candidate, b_candidate, rmse_ab
+                "    Stage 2 (b|c):  b={:.6}, RMSE={:.6}",
+                b_candidate, rmse_b
             );
 
-            // Accept a and b only if they don't overcorrect: the combined model
-            // r_corrected(r) must be monotonically increasing for r in [0, 1].
-            // Check at sample points across the radius.
+            // Check monotonicity with b and c combined (a=0 for now)
             let overcorrects = (0..=100).any(|i| {
                 let r = i as f64 / 100.0;
                 let r2 = r * r;
-                let r3 = r2 * r;
-                // Derivative of r_corrected = a*r^4 + b*r^3 + c*r^2 + d*r is:
-                //   4*a*r^3 + 3*b*r^2 + 2*c*r + d
-                let d = 1.0 - a_candidate - b_candidate - c_final;
-                let deriv = 4.0 * a_candidate * r3 + 3.0 * b_candidate * r2 + 2.0 * c_final * r + d;
+                let d = 1.0 - b_candidate - c_final;
+                let deriv = 3.0 * b_candidate * r2 + 2.0 * c_final * r + d;
                 deriv < 0.0
             });
 
             if overcorrects {
-                eprintln!("    a+b would cause overcorrection (non-monotonic mapping), skipping");
-                (0.0, 0.0)
+                eprintln!("    b would cause overcorrection (non-monotonic mapping), skipping");
+                0.0
             } else {
-                (a_candidate, b_candidate)
+                b_candidate
             }
         } else {
             eprintln!("    Too few stage 2 inliers, using c only");
-            (0.0, 0.0)
+            0.0
         }
     } else {
         eprintln!("    Too few stage 2 matches, using c only");
-        (0.0, 0.0)
+        0.0
+    };
+
+    // Stage 3: apply c+b correction to the raw image, then re-detect and
+    // re-match features against the preview to find residual distortion.
+    // Fit a only (the r^4 term).
+    eprintln!("    Applying c+b correction to raw image...");
+    let cb_corrected_rgb = apply_distortion(&raw_img.to_rgb8(), 0.0, b_final, c_final);
+    let cb_corrected_gray = histogram_equalize(&DynamicImage::ImageRgb8(cb_corrected_rgb).to_luma8());
+
+    eprintln!("    Detecting features on c+b-corrected image...");
+    let cb_corrected_corners = detect_harris_corners(&cb_corrected_gray, 500);
+    eprintln!(
+        "    Found {} corrected corners, {} preview corners",
+        cb_corrected_corners.len(),
+        preview_corners.len()
+    );
+
+    eprintln!("    Matching c+b-corrected image to preview...");
+    let stage3_matches = match_features(&cb_corrected_gray, &cb_corrected_corners, &preview_norm, &preview_corners);
+    eprintln!("    {} matches found", stage3_matches.len());
+
+    let a_final = if stage3_matches.len() >= 10 {
+        let stage3_inliers = filter_outliers(&stage3_matches, cx, cy, r_max);
+        eprintln!("    {} inliers after outlier rejection", stage3_inliers.len());
+
+        if stage3_inliers.len() >= 6 {
+            let mut scale3_ratios: Vec<f64> = Vec::new();
+            for &(corr_x, corr_y, prev_x, prev_y) in &stage3_inliers {
+                let r_corr = ((corr_x as f64 - cx).powi(2) + (corr_y as f64 - cy).powi(2)).sqrt() / r_max;
+                let r_prev = ((prev_x as f64 - cx).powi(2) + (prev_y as f64 - cy).powi(2)).sqrt() / r_max;
+                if r_prev > 0.05 && r_prev < 0.3 {
+                    scale3_ratios.push(r_corr / r_prev);
+                }
+            }
+            scale3_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let scale3 = if !scale3_ratios.is_empty() {
+                scale3_ratios[scale3_ratios.len() / 2]
+            } else {
+                1.0
+            };
+            eprintln!("    Residual scale factor: {:.6}", scale3);
+
+            // Build linear system for a only (c and b are already applied)
+            let n3 = stage3_inliers.len();
+            let mut a_mat3 = DMatrix::<f64>::zeros(n3, 1);
+            let mut b_vec3 = DVector::<f64>::zeros(n3);
+            let mut w_mat3 = DMatrix::<f64>::zeros(n3, n3);
+
+            for (i, &(corr_x, corr_y, prev_x, prev_y)) in stage3_inliers.iter().enumerate() {
+                let r_src = ((corr_x as f64 - cx).powi(2) + (corr_y as f64 - cy).powi(2)).sqrt() / r_max;
+                let r_src_scaled = r_src / scale3;
+                let r_out = ((prev_x as f64 - cx).powi(2) + (prev_y as f64 - cy).powi(2)).sqrt() / r_max;
+
+                if r_out < 1e-6 {
+                    continue;
+                }
+
+                let r_out4 = r_out * r_out * r_out * r_out;
+
+                a_mat3[(i, 0)] = r_out4 - r_out; // a term
+                b_vec3[i] = r_src_scaled - r_out;
+
+                let weight = 1.0 + 4.0 * r_out * r_out;
+                w_mat3[(i, i)] = weight;
+            }
+
+            let (a_raw, rmse_a) = solve_regularized(&a_mat3, &b_vec3, &w_mat3, lambda);
+            let a_candidate = -a_raw[0];
+            eprintln!(
+                "    Stage 3 (a|c,b):  a={:.6}, RMSE={:.6}",
+                a_candidate, rmse_a
+            );
+
+            // Check monotonicity with all three coefficients combined
+            let overcorrects = (0..=100).any(|i| {
+                let r = i as f64 / 100.0;
+                let r2 = r * r;
+                let r3 = r2 * r;
+                let d = 1.0 - a_candidate - b_final - c_final;
+                let deriv = 4.0 * a_candidate * r3 + 3.0 * b_final * r2 + 2.0 * c_final * r + d;
+                deriv < 0.0
+            });
+
+            if overcorrects {
+                eprintln!("    a would cause overcorrection (non-monotonic mapping), skipping");
+                0.0
+            } else {
+                a_candidate
+            }
+        } else {
+            eprintln!("    Too few stage 3 inliers, using c+b only");
+            0.0
+        }
+    } else {
+        eprintln!("    Too few stage 3 matches, using c+b only");
+        0.0
     };
 
     let d = 1.0 - a_final - b_final - c_final;

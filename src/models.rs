@@ -37,6 +37,7 @@ pub struct VignettingParams {
     pub k3: f64,
     pub focal_length: f64,
     pub aperture: f64,
+    pub distance: f64,
 }
 
 /// TCA (Transverse Chromatic Aberration) correction parameters (poly3 model)
