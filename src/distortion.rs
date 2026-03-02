@@ -211,9 +211,8 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
     }
 
     // Two-stage fitting: first determine c (the dominant barrel/pincushion
-    // term), then lock it and fit a + b for any residual higher-order
-    // distortion. This prevents the higher-order terms from destabilizing
-    // the primary correction.
+    // term), then apply it to produce a partially-corrected image and run
+    // fresh feature matching to determine a and b from the residual.
     //
     // Each stage uses weighted least squares with mild regularization.
     let lambda = 0.1;
@@ -223,44 +222,117 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
     let col_c = a_mat.column(2).clone_owned();
     let col_c_mat = DMatrix::from_column_slice(n, 1, col_c.as_slice());
     let (c_raw, rmse_c) = solve_regularized(&col_c_mat, &b_vec, &w_mat, lambda);
-    let c_val = c_raw[0];
-    let c_final = -c_val;
+    let c_final = -c_raw[0];
     eprintln!("    Stage 1 (c only):  c={:.6}, RMSE={:.6}", c_final, rmse_c);
 
-    // Stage 2: fit a + b with c locked. Subtract c's contribution from the
-    // RHS so we solve for the residual that a and b must explain.
-    let b_residual = &b_vec - c_val * &col_c;
-    let cols_ab = a_mat.columns(0, 2).clone_owned(); // columns 0 (a) and 1 (b)
-    let (ab_raw, rmse_ab) = solve_regularized(&cols_ab, &b_residual, &w_mat, lambda);
-    let a_val = ab_raw[0];
-    let b_val = ab_raw[1];
+    // Stage 2: apply c correction to the raw image, then re-detect and
+    // re-match features against the preview to find residual distortion.
+    eprintln!("    Applying c correction to raw image...");
+    let corrected_rgb = apply_distortion(&raw_img.to_rgb8(), 0.0, 0.0, c_final);
+    let corrected_gray = histogram_equalize(&DynamicImage::ImageRgb8(corrected_rgb).to_luma8());
+
+    eprintln!("    Detecting features on c-corrected image...");
+    let corrected_corners = detect_harris_corners(&corrected_gray, 500);
     eprintln!(
-        "    Stage 2 (a+b|c):  a={:.6}, b={:.6}, c={:.6}, RMSE={:.6}",
-        -a_val, -b_val, c_final, rmse_ab
+        "    Found {} corrected corners, {} preview corners",
+        corrected_corners.len(),
+        preview_corners.len()
     );
 
-    // Choose the simplest model that fits well enough.
-    // Only add a and b if they meaningfully improve on c alone (>50% RMSE reduction).
-    let (a_final, b_final, stage);
-    let improvement_ab = if rmse_c > 1e-12 { (rmse_c - rmse_ab) / rmse_c } else { 0.0 };
+    eprintln!("    Matching c-corrected image to preview...");
+    let stage2_matches = match_features(&corrected_gray, &corrected_corners, &preview_norm, &preview_corners);
+    eprintln!("    {} matches found", stage2_matches.len());
 
-    if improvement_ab > 0.50 {
-        a_final = -a_val;
-        b_final = -b_val;
-        stage = 2;
+    let (a_final, b_final) = if stage2_matches.len() >= 10 {
+        let stage2_inliers = filter_outliers(&stage2_matches, cx, cy, r_max);
+        eprintln!("    {} inliers after outlier rejection", stage2_inliers.len());
+
+        if stage2_inliers.len() >= 6 {
+            // Estimate scale for the c-corrected image vs preview
+            let mut scale2_ratios: Vec<f64> = Vec::new();
+            for &(corr_x, corr_y, prev_x, prev_y) in &stage2_inliers {
+                let r_corr = ((corr_x as f64 - cx).powi(2) + (corr_y as f64 - cy).powi(2)).sqrt() / r_max;
+                let r_prev = ((prev_x as f64 - cx).powi(2) + (prev_y as f64 - cy).powi(2)).sqrt() / r_max;
+                if r_prev > 0.05 && r_prev < 0.3 {
+                    scale2_ratios.push(r_corr / r_prev);
+                }
+            }
+            scale2_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let scale2 = if !scale2_ratios.is_empty() {
+                scale2_ratios[scale2_ratios.len() / 2]
+            } else {
+                1.0
+            };
+            eprintln!("    Residual scale factor: {:.6}", scale2);
+
+            // Build linear system for a and b only (c is already applied)
+            let n2 = stage2_inliers.len();
+            let mut a_mat2 = DMatrix::<f64>::zeros(n2, 2);
+            let mut b_vec2 = DVector::<f64>::zeros(n2);
+            let mut w_mat2 = DMatrix::<f64>::zeros(n2, n2);
+
+            for (i, &(corr_x, corr_y, prev_x, prev_y)) in stage2_inliers.iter().enumerate() {
+                let r_src = ((corr_x as f64 - cx).powi(2) + (corr_y as f64 - cy).powi(2)).sqrt() / r_max;
+                let r_src_scaled = r_src / scale2;
+                let r_out = ((prev_x as f64 - cx).powi(2) + (prev_y as f64 - cy).powi(2)).sqrt() / r_max;
+
+                if r_out < 1e-6 {
+                    continue;
+                }
+
+                let r_out3 = r_out * r_out * r_out;
+                let r_out4 = r_out3 * r_out;
+
+                a_mat2[(i, 0)] = r_out4 - r_out; // a term
+                a_mat2[(i, 1)] = r_out3 - r_out; // b term
+                b_vec2[i] = r_src_scaled - r_out;
+
+                let weight = 1.0 + 4.0 * r_out * r_out;
+                w_mat2[(i, i)] = weight;
+            }
+
+            let (ab_raw, rmse_ab) = solve_regularized(&a_mat2, &b_vec2, &w_mat2, lambda);
+            let a_candidate = -ab_raw[0];
+            let b_candidate = -ab_raw[1];
+            eprintln!(
+                "    Stage 2 (a+b|c):  a={:.6}, b={:.6}, RMSE={:.6}",
+                a_candidate, b_candidate, rmse_ab
+            );
+
+            // Accept a and b only if they don't overcorrect: the combined model
+            // r_corrected(r) must be monotonically increasing for r in [0, 1].
+            // Check at sample points across the radius.
+            let overcorrects = (0..=100).any(|i| {
+                let r = i as f64 / 100.0;
+                let r2 = r * r;
+                let r3 = r2 * r;
+                // Derivative of r_corrected = a*r^4 + b*r^3 + c*r^2 + d*r is:
+                //   4*a*r^3 + 3*b*r^2 + 2*c*r + d
+                let d = 1.0 - a_candidate - b_candidate - c_final;
+                let deriv = 4.0 * a_candidate * r3 + 3.0 * b_candidate * r2 + 2.0 * c_final * r + d;
+                deriv < 0.0
+            });
+
+            if overcorrects {
+                eprintln!("    a+b would cause overcorrection (non-monotonic mapping), skipping");
+                (0.0, 0.0)
+            } else {
+                (a_candidate, b_candidate)
+            }
+        } else {
+            eprintln!("    Too few stage 2 inliers, using c only");
+            (0.0, 0.0)
+        }
     } else {
-        a_final = 0.0;
-        b_final = 0.0;
-        stage = 1;
-    }
+        eprintln!("    Too few stage 2 matches, using c only");
+        (0.0, 0.0)
+    };
 
     let d = 1.0 - a_final - b_final - c_final;
     eprintln!(
-        "    Selected stage {} (a+b improvement: {:.1}%)",
-        stage,
-        improvement_ab * 100.0
+        "    Final: a={:.6}, b={:.6}, c={:.6}, d={:.6}",
+        a_final, b_final, c_final, d
     );
-    eprintln!("    d (linear term) = {:.6} (should be close to 1.0)", d);
 
     (a_final, b_final, c_final)
 }
