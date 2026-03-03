@@ -1,8 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use image::imageops::FilterType;
 use image::DynamicImage;
 use rawler::decoders::RawDecodeParams;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const RAW_EXTENSIONS: &[&str] = &[
     "nef", "arw", "cr2", "cr3", "dng", "raf", "rw2", "orf", "pef", "srw",
@@ -72,6 +72,37 @@ fn resize(img: DynamicImage, max_dim: u32) -> DynamicImage {
     } else {
         img
     }
+}
+
+/// Look for a reference image next to the raw file.
+/// Searches for `{stem}-reference.{jpg,jpeg,png}` in the same directory.
+pub fn find_reference_image(raw_path: &Path) -> Result<PathBuf> {
+    let parent = raw_path.parent().unwrap_or(Path::new("."));
+    let stem = raw_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .context("Could not determine file stem")?;
+
+    for ext in &["jpg", "jpeg", "png"] {
+        let candidate = parent.join(format!("{}-reference.{}", stem, ext));
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    bail!(
+        "No reference image found for {}. Expected one of: {}-reference.{{jpg,jpeg,png}} in {}",
+        raw_path.display(),
+        stem,
+        parent.display()
+    )
+}
+
+/// Load a reference image (e.g., phone photo) and resize to MAX_DIM.
+pub fn load_reference_image(path: &Path) -> Result<DynamicImage> {
+    let img = image::open(path)
+        .with_context(|| format!("Failed to open reference image: {}", path.display()))?;
+    Ok(resize(img, MAX_DIM))
 }
 
 /// Ensure two images have the same dimensions by center-cropping the larger one.

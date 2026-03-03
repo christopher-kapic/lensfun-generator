@@ -104,7 +104,7 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
     );
 
     eprintln!("    Matching features...");
-    let matches = match_features(&raw_norm, &raw_corners, &preview_norm, &preview_corners);
+    let matches = match_features(&raw_norm, &raw_corners, &preview_norm, &preview_corners, 0.2);
     eprintln!("    {} matches found", matches.len());
 
     if matches.len() < 10 {
@@ -235,7 +235,7 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
     eprintln!("    Detecting features on c-corrected image...");
     let c_corrected_corners = detect_harris_corners(&c_corrected_gray, 500);
     eprintln!("    Matching c-corrected image to preview...");
-    let stage2_matches = match_features(&c_corrected_gray, &c_corrected_corners, &preview_norm, &preview_corners);
+    let stage2_matches = match_features(&c_corrected_gray, &c_corrected_corners, &preview_norm, &preview_corners, 0.2);
     eprintln!("    {} matches found", stage2_matches.len());
 
     // Get initial b estimate from least-squares
@@ -331,7 +331,7 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
     eprintln!("    Detecting features on c+b-corrected image...");
     let cb_corrected_corners = detect_harris_corners(&cb_corrected_gray, 500);
     eprintln!("    Matching c+b-corrected image to preview...");
-    let stage3_matches = match_features(&cb_corrected_gray, &cb_corrected_corners, preview_eq, &preview_corners);
+    let stage3_matches = match_features(&cb_corrected_gray, &cb_corrected_corners, preview_eq, &preview_corners, 0.2);
     eprintln!("    {} matches found", stage3_matches.len());
 
     // Get initial a estimate from least-squares
@@ -564,7 +564,7 @@ fn solve_regularized(
 /// Simple histogram equalization to normalize brightness/contrast.
 /// This helps match features between the raw decode (flat, low-contrast)
 /// and the camera preview (punchy, contrasty S-curve).
-fn histogram_equalize(img: &GrayImage) -> GrayImage {
+pub(crate) fn histogram_equalize(img: &GrayImage) -> GrayImage {
     let (w, h) = img.dimensions();
     let total = (w * h) as f64;
 
@@ -596,7 +596,7 @@ fn histogram_equalize(img: &GrayImage) -> GrayImage {
 
 /// Detect Harris corners in a grayscale image.
 /// Returns up to `max_corners` strongest corners as (x, y) positions.
-fn detect_harris_corners(img: &GrayImage, max_corners: usize) -> Vec<(u32, u32)> {
+pub(crate) fn detect_harris_corners(img: &GrayImage, max_corners: usize) -> Vec<(u32, u32)> {
     let (w, h) = img.dimensions();
     if w < 10 || h < 10 {
         return Vec::new();
@@ -679,11 +679,12 @@ fn detect_harris_corners(img: &GrayImage, max_corners: usize) -> Vec<(u32, u32)>
 /// on local patches. NCC is invariant to linear brightness/contrast changes.
 ///
 /// Returns matched pairs: (raw_x, raw_y, preview_x, preview_y).
-fn match_features(
+pub(crate) fn match_features(
     raw: &GrayImage,
     raw_corners: &[(u32, u32)],
     preview: &GrayImage,
     preview_corners: &[(u32, u32)],
+    max_search_fraction: f64,
 ) -> Vec<(u32, u32, u32, u32)> {
     let patch_half = 12i32; // 25x25 patches
 
@@ -697,11 +698,10 @@ fn match_features(
 
         for &(px, py) in preview_corners {
             // Only consider matches within a reasonable search radius
-            // (distortion shouldn't move points more than ~10% of image size)
             let dx = rx as i32 - px as i32;
             let dy = ry as i32 - py as i32;
             let dist2 = dx * dx + dy * dy;
-            let max_dist = (raw.width().max(raw.height()) as i32) / 5;
+            let max_dist = (raw.width().max(raw.height()) as f64 * max_search_fraction) as i32;
             if dist2 > max_dist * max_dist {
                 continue;
             }
@@ -729,7 +729,7 @@ fn match_features(
 /// Compute normalized cross-correlation between two patches.
 /// Returns a value in [-1, 1] where 1 = perfect match.
 /// NCC is invariant to linear brightness and contrast differences.
-fn compute_ncc(
+pub(crate) fn compute_ncc(
     img_a: &GrayImage,
     ax: u32,
     ay: u32,

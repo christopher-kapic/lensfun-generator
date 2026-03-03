@@ -1,5 +1,6 @@
 mod distortion;
 mod exif;
+mod homography;
 mod image_util;
 mod models;
 mod similarity;
@@ -13,7 +14,7 @@ use dialoguer::Input;
 use std::path::PathBuf;
 
 use crate::exif::read_exif;
-use crate::image_util::{find_raw_files, load_camera_preview, load_raw_uncorrected, match_dimensions};
+use crate::image_util::{find_raw_files, find_reference_image, load_camera_preview, load_raw_uncorrected, load_reference_image, match_dimensions};
 use crate::models::{CalibrationProject, LensInfo, LensType};
 
 #[derive(Parser)]
@@ -42,6 +43,12 @@ struct Cli {
     /// Output file path (default: print to stdout)
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Use an external reference image instead of the camera's embedded preview
+    /// for distortion calibration. Expects {stem}-reference.{jpg,jpeg,png} next
+    /// to each raw file.
+    #[arg(long)]
+    use_reference_image: bool,
 }
 
 fn main() -> Result<()> {
@@ -159,21 +166,42 @@ fn main() -> Result<()> {
             eprintln!("    Decoding raw sensor data...");
             let raw_img = load_raw_uncorrected(dist_file)?;
 
-            eprintln!("    Extracting camera preview...");
-            let preview_img = load_camera_preview(dist_file)?;
+            let reference_img = if cli.use_reference_image {
+                eprintln!("    Looking for reference image...");
+                let ref_path = find_reference_image(dist_file)?;
+                eprintln!("    Found reference: {}", ref_path.display());
+                let ref_img = load_reference_image(&ref_path)?;
+                let (raw_sized, ref_sized) = match_dimensions(&raw_img, &ref_img);
+                eprintln!("    Aligning reference image via homography...");
+                let aligned = homography::align_reference(&raw_sized, &ref_sized)?;
+                let (raw_final, aligned_final) = match_dimensions(&raw_sized, &aligned);
+                eprintln!(
+                    "    Raw: {}x{}, Aligned reference: {}x{}",
+                    raw_final.width(),
+                    raw_final.height(),
+                    aligned_final.width(),
+                    aligned_final.height()
+                );
+                // Return the raw and aligned reference for distortion fitting
+                (raw_final, aligned_final)
+            } else {
+                eprintln!("    Extracting camera preview...");
+                let preview_img = load_camera_preview(dist_file)?;
+                let (raw_sized, preview_sized) = match_dimensions(&raw_img, &preview_img);
+                eprintln!(
+                    "    Raw: {}x{}, Preview: {}x{}",
+                    raw_sized.width(),
+                    raw_sized.height(),
+                    preview_sized.width(),
+                    preview_sized.height()
+                );
+                (raw_sized, preview_sized)
+            };
 
-            let (raw_img, preview_img) = match_dimensions(&raw_img, &preview_img);
-
-            eprintln!(
-                "    Raw: {}x{}, Preview: {}x{}",
-                raw_img.width(),
-                raw_img.height(),
-                preview_img.width(),
-                preview_img.height()
-            );
+            let (raw_final, corrected_final) = reference_img;
 
             eprintln!("    Optimizing distortion parameters...");
-            let (a, b, c) = distortion::optimize_distortion(&raw_img, &preview_img);
+            let (a, b, c) = distortion::optimize_distortion(&raw_final, &corrected_final);
             eprintln!("    Result: a={:.6}, b={:.6}, c={:.6}", a, b, c);
 
             distortion_params.push(crate::models::DistortionParams {
