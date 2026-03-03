@@ -1,41 +1,70 @@
 use anyhow::{bail, Context, Result};
-use image::GenericImageView;
+use image::{DynamicImage, GenericImageView};
 use nalgebra::{DMatrix, DVector};
 use rawler::decoders::RawDecodeParams;
+use rawler::imgop::develop::{ProcessingStep, RawDevelop};
+use rawler::rawsource::RawSource;
 use std::path::Path;
 
 use crate::image_util::is_raw_file;
 use crate::models::VignettingParams;
 
+/// Decode a RAW file to linear RGB (no sRGB gamma applied).
+///
+/// This uses rawler's processing pipeline but omits the final SRgb step,
+/// producing linear light values suitable for vignetting analysis.
+fn raw_to_linear(path: &Path) -> Result<DynamicImage> {
+    let rawfile = RawSource::new(path)
+        .with_context(|| format!("Failed to open RAW file: {}", path.display()))?;
+    let decoder = rawler::get_decoder(&rawfile)
+        .with_context(|| format!("Failed to get decoder for: {}", path.display()))?;
+    let rawimage = decoder
+        .raw_image(&rawfile, &RawDecodeParams::default(), false)
+        .with_context(|| format!("Failed to decode RAW image: {}", path.display()))?;
+
+    let dev = RawDevelop {
+        steps: vec![
+            ProcessingStep::Rescale,
+            ProcessingStep::Demosaic,
+            ProcessingStep::CropActiveArea,
+            ProcessingStep::WhiteBalance,
+            ProcessingStep::Calibrate,
+            ProcessingStep::CropDefault,
+            // No ProcessingStep::SRgb — keep linear light values
+        ],
+    };
+
+    dev.develop_intermediate(&rawimage)?
+        .to_dynamic_image()
+        .context("Failed to convert intermediate to DynamicImage")
+}
+
 /// Analyze a diffuser image and compute vignetting correction parameters.
 ///
-/// Uses the raw sensor decode (not embedded preview) to get uncorrected vignetting data.
-///
-/// The vignetting model is: v(r) = 1 + k1*r^2 + k2*r^4 + k3*r^6
-/// where r is normalized so r=1 at image corners.
-///
-/// Samples average brightness at concentric rings from center to corners,
-/// then fits the polynomial using least squares.
+/// Uses the raw sensor decode (not embedded preview) to get uncorrected vignetting data
+/// in linear light (no gamma). The vignetting model is:
+///   v(r) = 1 + k1*r^2 + k2*r^4 + k3*r^6
+/// where r is normalized so r=1 at the half-diagonal (image edge),
+/// matching lensfun's expected convention.
 pub fn analyze_vignetting(path: &Path, focal_length: f64, aperture: f64, distance: f64) -> Result<VignettingParams> {
     if !path.exists() {
         bail!("File not found: {}", path.display());
     }
 
-    // Always use raw sensor data for vignetting analysis
+    // Use linear RGB for RAW files (no sRGB gamma), or open as-is for other formats
     let img = if is_raw_file(path) {
-        let params = RawDecodeParams::default();
-        rawler::analyze::raw_to_srgb(path, &params)
-            .with_context(|| format!("Failed to decode RAW file: {}", path.display()))?
+        raw_to_linear(path)?
     } else {
         image::open(path)
             .with_context(|| format!("Failed to open image: {}", path.display()))?
     };
 
     let (width, height) = img.dimensions();
-    let rgb = img.to_rgb8();
+    let rgb = img.to_rgb16();
 
     let cx = width as f64 / 2.0;
     let cy = height as f64 / 2.0;
+    // Normalize radius to half-diagonal (r=1 at image edge), matching lensfun convention
     let r_max = (cx * cx + cy * cy).sqrt();
 
     let num_rings = 100;
