@@ -225,26 +225,21 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
     let c_final = -c_raw[0];
     eprintln!("    Stage 1 (c only):  c={:.6}, RMSE={:.6}", c_final, rmse_c);
 
-    // Stage 2: apply c correction to the raw image, then re-detect and
-    // re-match features against the preview to find residual distortion.
-    // Fit b only (the r^3 term).
+    // Stage 2: determine b using binary search with image similarity.
+    // Get initial b estimate from feature matching, then refine by comparing
+    // corrected images directly against the preview.
     eprintln!("    Applying c correction to raw image...");
     let c_corrected_rgb = apply_distortion(&raw_img.to_rgb8(), 0.0, 0.0, c_final);
     let c_corrected_gray = histogram_equalize(&DynamicImage::ImageRgb8(c_corrected_rgb).to_luma8());
 
     eprintln!("    Detecting features on c-corrected image...");
     let c_corrected_corners = detect_harris_corners(&c_corrected_gray, 500);
-    eprintln!(
-        "    Found {} corrected corners, {} preview corners",
-        c_corrected_corners.len(),
-        preview_corners.len()
-    );
-
     eprintln!("    Matching c-corrected image to preview...");
     let stage2_matches = match_features(&c_corrected_gray, &c_corrected_corners, &preview_norm, &preview_corners);
     eprintln!("    {} matches found", stage2_matches.len());
 
-    let b_final = if stage2_matches.len() >= 10 {
+    // Get initial b estimate from least-squares
+    let b_initial = if stage2_matches.len() >= 10 {
         let stage2_inliers = filter_outliers(&stage2_matches, cx, cy, r_max);
         eprintln!("    {} inliers after outlier rejection", stage2_inliers.len());
 
@@ -263,83 +258,84 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
             } else {
                 1.0
             };
-            eprintln!("    Residual scale factor: {:.6}", scale2);
 
-            // Build linear system for b only (c is already applied)
             let n2 = stage2_inliers.len();
             let mut b_mat2 = DMatrix::<f64>::zeros(n2, 1);
             let mut b_vec2 = DVector::<f64>::zeros(n2);
             let mut w_mat2 = DMatrix::<f64>::zeros(n2, n2);
 
-            for (i, &(corr_x, corr_y, prev_x, prev_y)) in stage2_inliers.iter().enumerate() {
+            for (i, &(corr_x, corr_y, _prev_x, prev_y)) in stage2_inliers.iter().enumerate() {
                 let r_src = ((corr_x as f64 - cx).powi(2) + (corr_y as f64 - cy).powi(2)).sqrt() / r_max;
                 let r_src_scaled = r_src / scale2;
-                let r_out = ((prev_x as f64 - cx).powi(2) + (prev_y as f64 - cy).powi(2)).sqrt() / r_max;
+                let prev_dx = _prev_x as f64 - cx;
+                let prev_dy = prev_y as f64 - cy;
+                let r_out = (prev_dx * prev_dx + prev_dy * prev_dy).sqrt() / r_max;
 
                 if r_out < 1e-6 {
                     continue;
                 }
 
                 let r_out3 = r_out * r_out * r_out;
-
-                b_mat2[(i, 0)] = r_out3 - r_out; // b term
+                b_mat2[(i, 0)] = r_out3 - r_out;
                 b_vec2[i] = r_src_scaled - r_out;
-
                 let weight = 1.0 + 4.0 * r_out * r_out;
                 w_mat2[(i, i)] = weight;
             }
 
-            let (b_raw, rmse_b) = solve_regularized(&b_mat2, &b_vec2, &w_mat2, lambda);
-            let b_candidate = -b_raw[0];
-            eprintln!(
-                "    Stage 2 (b|c):  b={:.6}, RMSE={:.6}",
-                b_candidate, rmse_b
-            );
-
-            // Check monotonicity with b and c combined (a=0 for now)
-            let overcorrects = (0..=100).any(|i| {
-                let r = i as f64 / 100.0;
-                let r2 = r * r;
-                let d = 1.0 - b_candidate - c_final;
-                let deriv = 3.0 * b_candidate * r2 + 2.0 * c_final * r + d;
-                deriv < 0.0
-            });
-
-            if overcorrects {
-                eprintln!("    b would cause overcorrection (non-monotonic mapping), skipping");
-                0.0
-            } else {
-                b_candidate
-            }
+            let (b_raw, _rmse_b) = solve_regularized(&b_mat2, &b_vec2, &w_mat2, lambda);
+            -b_raw[0]
         } else {
-            eprintln!("    Too few stage 2 inliers, using c only");
             0.0
         }
     } else {
-        eprintln!("    Too few stage 2 matches, using c only");
         0.0
     };
+    eprintln!("    Stage 2 initial b estimate: {:.6}", b_initial);
 
-    // Stage 3: apply c+b correction to the raw image, then re-detect and
-    // re-match features against the preview to find residual distortion.
-    // Fit a only (the r^4 term).
+    // Binary search refinement for b using direct image comparison
+    let raw_rgb = raw_img.to_rgb8();
+    let preview_eq = &preview_norm;
+
+    let b_final = if b_initial.abs() < 1e-8 {
+        0.0
+    } else {
+        binary_search_param(
+            &raw_rgb, preview_eq, c_final, b_initial,
+            |raw, prev, b_val| {
+                // Check monotonicity before generating image
+                let overcorrects = (0..=100).any(|i| {
+                    let r = i as f64 / 100.0;
+                    let r2 = r * r;
+                    let d = 1.0 - b_val - c_final;
+                    let deriv = 3.0 * b_val * r2 + 2.0 * c_final * r + d;
+                    deriv < 0.0
+                });
+                if overcorrects {
+                    return f64::MAX;
+                }
+                let corrected = apply_distortion(raw, 0.0, b_val, c_final);
+                let corrected_gray = histogram_equalize(&DynamicImage::ImageRgb8(corrected).to_luma8());
+                image_similarity(&corrected_gray, prev)
+            },
+            "b",
+        )
+    };
+    eprintln!("    Stage 2 final b: {:.6}", b_final);
+
+    // Stage 3: determine a using binary search with image similarity.
+    // Get initial a estimate from feature matching on the c+b corrected image.
     eprintln!("    Applying c+b correction to raw image...");
-    let cb_corrected_rgb = apply_distortion(&raw_img.to_rgb8(), 0.0, b_final, c_final);
+    let cb_corrected_rgb = apply_distortion(&raw_rgb, 0.0, b_final, c_final);
     let cb_corrected_gray = histogram_equalize(&DynamicImage::ImageRgb8(cb_corrected_rgb).to_luma8());
 
     eprintln!("    Detecting features on c+b-corrected image...");
     let cb_corrected_corners = detect_harris_corners(&cb_corrected_gray, 500);
-    eprintln!(
-        "    Found {} corrected corners, {} preview corners",
-        cb_corrected_corners.len(),
-        preview_corners.len()
-    );
-
     eprintln!("    Matching c+b-corrected image to preview...");
-    let stage3_matches = match_features(&cb_corrected_gray, &cb_corrected_corners, &preview_norm, &preview_corners);
+    let stage3_matches = match_features(&cb_corrected_gray, &cb_corrected_corners, preview_eq, &preview_corners);
     eprintln!("    {} matches found", stage3_matches.len());
 
-    let a_final = if stage3_matches.len() >= 10 {
+    // Get initial a estimate from least-squares
+    let a_initial = if stage3_matches.len() >= 10 {
         let stage3_inliers = filter_outliers(&stage3_matches, cx, cy, r_max);
         eprintln!("    {} inliers after outlier rejection", stage3_inliers.len());
 
@@ -358,63 +354,67 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
             } else {
                 1.0
             };
-            eprintln!("    Residual scale factor: {:.6}", scale3);
 
-            // Build linear system for a only (c and b are already applied)
             let n3 = stage3_inliers.len();
             let mut a_mat3 = DMatrix::<f64>::zeros(n3, 1);
             let mut b_vec3 = DVector::<f64>::zeros(n3);
             let mut w_mat3 = DMatrix::<f64>::zeros(n3, n3);
 
-            for (i, &(corr_x, corr_y, prev_x, prev_y)) in stage3_inliers.iter().enumerate() {
+            for (i, &(corr_x, corr_y, _prev_x, prev_y)) in stage3_inliers.iter().enumerate() {
                 let r_src = ((corr_x as f64 - cx).powi(2) + (corr_y as f64 - cy).powi(2)).sqrt() / r_max;
                 let r_src_scaled = r_src / scale3;
-                let r_out = ((prev_x as f64 - cx).powi(2) + (prev_y as f64 - cy).powi(2)).sqrt() / r_max;
+                let prev_dx = _prev_x as f64 - cx;
+                let prev_dy = prev_y as f64 - cy;
+                let r_out = (prev_dx * prev_dx + prev_dy * prev_dy).sqrt() / r_max;
 
                 if r_out < 1e-6 {
                     continue;
                 }
 
                 let r_out4 = r_out * r_out * r_out * r_out;
-
-                a_mat3[(i, 0)] = r_out4 - r_out; // a term
+                a_mat3[(i, 0)] = r_out4 - r_out;
                 b_vec3[i] = r_src_scaled - r_out;
-
                 let weight = 1.0 + 4.0 * r_out * r_out;
                 w_mat3[(i, i)] = weight;
             }
 
-            let (a_raw, rmse_a) = solve_regularized(&a_mat3, &b_vec3, &w_mat3, lambda);
-            let a_candidate = -a_raw[0];
-            eprintln!(
-                "    Stage 3 (a|c,b):  a={:.6}, RMSE={:.6}",
-                a_candidate, rmse_a
-            );
-
-            // Check monotonicity with all three coefficients combined
-            let overcorrects = (0..=100).any(|i| {
-                let r = i as f64 / 100.0;
-                let r2 = r * r;
-                let r3 = r2 * r;
-                let d = 1.0 - a_candidate - b_final - c_final;
-                let deriv = 4.0 * a_candidate * r3 + 3.0 * b_final * r2 + 2.0 * c_final * r + d;
-                deriv < 0.0
-            });
-
-            if overcorrects {
-                eprintln!("    a would cause overcorrection (non-monotonic mapping), skipping");
-                0.0
-            } else {
-                a_candidate
-            }
+            let (a_raw, _rmse_a) = solve_regularized(&a_mat3, &b_vec3, &w_mat3, lambda);
+            -a_raw[0]
         } else {
-            eprintln!("    Too few stage 3 inliers, using c+b only");
             0.0
         }
     } else {
-        eprintln!("    Too few stage 3 matches, using c+b only");
         0.0
     };
+    eprintln!("    Stage 3 initial a estimate: {:.6}", a_initial);
+
+    // Binary search refinement for a using direct image comparison
+    let a_final = if a_initial.abs() < 1e-8 {
+        0.0
+    } else {
+        binary_search_param(
+            &raw_rgb, preview_eq, c_final, a_initial,
+            |raw, prev, a_val| {
+                // Check monotonicity before generating image
+                let overcorrects = (0..=100).any(|i| {
+                    let r = i as f64 / 100.0;
+                    let r2 = r * r;
+                    let r3 = r2 * r;
+                    let d = 1.0 - a_val - b_final - c_final;
+                    let deriv = 4.0 * a_val * r3 + 3.0 * b_final * r2 + 2.0 * c_final * r + d;
+                    deriv < 0.0
+                });
+                if overcorrects {
+                    return f64::MAX;
+                }
+                let corrected = apply_distortion(raw, a_val, b_final, c_final);
+                let corrected_gray = histogram_equalize(&DynamicImage::ImageRgb8(corrected).to_luma8());
+                image_similarity(&corrected_gray, prev)
+            },
+            "a",
+        )
+    };
+    eprintln!("    Stage 3 final a: {:.6}", a_final);
 
     let d = 1.0 - a_final - b_final - c_final;
     eprintln!(
@@ -423,6 +423,118 @@ pub fn optimize_distortion(raw_img: &DynamicImage, preview_img: &DynamicImage) -
     );
 
     (a_final, b_final, c_final)
+}
+
+/// Binary search refinement for a distortion parameter.
+///
+/// Starting from an initial estimate, searches between 0 and the estimate
+/// (and beyond) to find the value that minimizes image dissimilarity
+/// against the preview. The `cost_fn` takes (raw_rgb, preview_gray, param_value)
+/// and returns a dissimilarity score (lower = better).
+fn binary_search_param<F>(
+    raw_rgb: &ImageBuffer<Rgb<u8>, Vec<u8>>,
+    preview_gray: &GrayImage,
+    _c: f64,
+    initial_estimate: f64,
+    cost_fn: F,
+    param_name: &str,
+) -> f64
+where
+    F: Fn(&ImageBuffer<Rgb<u8>, Vec<u8>>, &GrayImage, f64) -> f64,
+{
+    // Search between 0 and 2*initial_estimate to allow overshoot
+    let mut lo = initial_estimate.min(0.0) * 2.0;
+    let mut hi = initial_estimate.max(0.0) * 2.0;
+
+    // Ensure lo < hi
+    if (hi - lo).abs() < 1e-10 {
+        lo = initial_estimate - initial_estimate.abs().max(0.01);
+        hi = initial_estimate + initial_estimate.abs().max(0.01);
+    }
+
+    let max_iterations = 20;
+    let convergence_threshold = 1e-6;
+
+    eprintln!(
+        "    Binary search for {}: initial={:.6}, range=[{:.6}, {:.6}]",
+        param_name, initial_estimate, lo, hi
+    );
+
+    for iter in 0..max_iterations {
+        let mid = (lo + hi) / 2.0;
+        let step = (hi - lo) / 4.0;
+
+        if step.abs() < convergence_threshold {
+            eprintln!(
+                "    Binary search converged after {} iterations: {}={:.6}",
+                iter, param_name, mid
+            );
+            return mid;
+        }
+
+        let val_lo = mid - step;
+        let val_hi = mid + step;
+
+        let cost_lo = cost_fn(raw_rgb, preview_gray, val_lo);
+        let cost_hi = cost_fn(raw_rgb, preview_gray, val_hi);
+
+        if cost_lo < cost_hi {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+
+        eprintln!(
+            "    iter {}: range=[{:.6}, {:.6}], cost_lo={:.4}, cost_hi={:.4}",
+            iter, lo, hi, cost_lo, cost_hi
+        );
+    }
+
+    let result = (lo + hi) / 2.0;
+    eprintln!(
+        "    Binary search finished: {}={:.6}",
+        param_name, result
+    );
+    result
+}
+
+/// Compute image dissimilarity between two grayscale images.
+/// Returns mean squared error over all non-black pixels (lower = more similar).
+/// Only compares pixels where both images have non-zero values, to avoid
+/// penalizing black border regions introduced by distortion correction.
+fn image_similarity(img_a: &GrayImage, img_b: &GrayImage) -> f64 {
+    let (w_a, h_a) = img_a.dimensions();
+    let (w_b, h_b) = img_b.dimensions();
+    let w = w_a.min(w_b);
+    let h = h_a.min(h_b);
+
+    // Skip a margin to avoid edge artifacts from distortion correction
+    let margin = (w.min(h) as f64 * 0.02) as u32;
+
+    let mut sum_sq_diff = 0.0_f64;
+    let mut count = 0u64;
+
+    for y in margin..h - margin {
+        for x in margin..w - margin {
+            let a = img_a.get_pixel(x, y)[0];
+            let b = img_b.get_pixel(x, y)[0];
+
+            // Skip pixels where either image is black (border from distortion)
+            if a < 2 || b < 2 {
+                continue;
+            }
+
+            let diff = a as f64 - b as f64;
+            sum_sq_diff += diff * diff;
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return f64::MAX;
+    }
+
+    sum_sq_diff / count as f64
 }
 
 /// Solve a weighted least squares problem with Tikhonov regularization.
